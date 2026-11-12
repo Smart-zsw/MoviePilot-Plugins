@@ -1,0 +1,16 @@
+{
+  "LocalMirror115": {
+    "name": "本地115镜像",
+    "description": "本地媒体库实时同步到115，并把非视频文件复制到STRM目录",
+    "labels": "云盘,同步,STRM",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/Smart-zsw/MoviePilot-Plugins/main/icons/localmirror115.png",
+    "author": "Smart-zsw",
+    "level": 1,
+    "system_version": ">=3.2.5",
+    "release": true,
+    "history": {
+      "v1.0.0": "首次发布：本地文件变化实时上传115、非视频文件复制到STRM目录、受保护的同步删除；115目录树/逐个比对两种方式，试运行默认开启。"
+    }
+  }
+}

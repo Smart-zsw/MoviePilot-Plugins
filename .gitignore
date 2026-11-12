@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 本地开发环境与数据
+.venv*/
+*.db
+*.sqlite*
+.DS_Store

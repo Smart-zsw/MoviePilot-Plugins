@@ -1,0 +1,8 @@
+[project]
+name = "moviepilot-plugin-localmirror115"
+dynamic = ["version"]
+requires-python = ">=3.14"
+dependencies = [
+    # 目录树比对与批量删除用；范围包含 P115StrmHelper 固定的版本，两个插件可以同时安装
+    "p115client>=0.0.9.7.2,<0.0.10",
+]

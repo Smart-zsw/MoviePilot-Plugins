@@ -1,0 +1,78 @@
+# 插件发布：索引 package.v3.json 有变化时，校验版本、运行测试，
+# 再把声明了 "release": true 且代码有变化的插件打包成 GitHub Release（与官方插件仓库的发布规则一致）。
+name: 插件发布
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'package.v3.json'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: 校验索引与插件版本一致
+        run: python .github/scripts/check_plugin_versions.py package.v3.json
+
+      - name: 运行测试
+        run: |
+          python -m pip install "SQLAlchemy==2.0.52" "watchfiles==1.2.0" "pydantic==2.13.4" "pytest==9.0.3"
+          python -m pytest -q -p no:cacheprovider tests/v3
+
+      - name: 打包并发布有变化的插件
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pkg_file=package.v3.json
+          # 只打包声明了 release=true 的插件
+          mapfile -t entries < <(jq -r 'to_entries | map(select(.value.release == true)) | .[] | "\(.key)|\(.value.version)"' "$pkg_file")
+          for entry in "${entries[@]}"; do
+            plugin_id="${entry%%|*}"
+            plugin_version="${entry##*|}"
+            plugin_id_lc="$(echo "$plugin_id" | tr '[:upper:]' '[:lower:]')"
+            plugin_dir="plugins.v3/$plugin_id_lc"
+            [ -d "$plugin_dir" ] || { echo "缺少插件目录 $plugin_dir" >&2; exit 1; }
+
+            tag="${plugin_id}_v${plugin_version}"
+            asset="${plugin_id_lc}_v${plugin_version}.zip"
+            notes="$(jq -r --arg id "$plugin_id" --arg v "v$plugin_version" '.[$id].history[$v] // empty' "$pkg_file")"
+            [ -n "$notes" ] || notes="$plugin_id $plugin_version"
+
+            # 同一版本的插件目录自上次发布以来没有变化时，只同步发布说明
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null && git diff --quiet "$tag" -- "$plugin_dir"; then
+              echo "$plugin_dir 自 $tag 以来没有变化，跳过打包"
+              if gh release view "$tag" >/dev/null 2>&1; then
+                gh release edit "$tag" --notes "$notes"
+              fi
+              continue
+            fi
+
+            echo "打包 $plugin_id：$plugin_dir -> $asset"
+            rm -f "$asset"
+            (cd "$(dirname "$plugin_dir")" && zip -r "$GITHUB_WORKSPACE/$asset" "$(basename "$plugin_dir")" -x "*/__pycache__/*" -x "*.pyc") >/dev/null
+
+            # 重新发布同一版本时替换原有的 Release 与 Tag
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release delete "$tag" -y
+              git push origin ":refs/tags/$tag" || true
+            fi
+            git tag -d "$tag" >/dev/null 2>&1 || true
+
+            gh release create "$tag" "$asset" --title "$tag" --notes "$notes" --latest --target "$GITHUB_SHA"
+          done
