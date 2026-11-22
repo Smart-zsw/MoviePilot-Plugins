@@ -12,9 +12,14 @@ DEFAULT_VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.ts', '.iso', '.rmvb', '.avi', '.mo
                             '.vob', '.webm', '.mts', '.m2t', '.rm', '.divx', '.ogm')
 VIDEO_EXTENSIONS = frozenset(DEFAULT_VIDEO_EXTENSIONS)
 TEMP_SUFFIX = '.lm115tmp'  # 复制到 STRM 目录时的临时文件后缀
-# 系统垃圾文件与插件自身的临时文件，绝不镜像。
+# 默认排除的系统垃圾文件与下载中的临时文件（设置里可修改）。
 DEFAULT_EXCLUDES = ('.DS_Store', 'Thumbs.db', 'desktop.ini', '._*', '*.tmp', '*.part', '*.!qb',
-                    '*' + TEMP_SUFFIX, '@eaDir', '#recycle', '#snapshot', '.snapshot', 'lost+found')
+                    '.snapshot', 'lost+found')
+# 各类 NAS 与操作系统的回收站、缩略图、索引目录：不论用户如何配置排除规则都排除，避免把回收站内容当成媒体镜像。
+SYSTEM_EXCLUDES = ('@Recycle', '@Recently-Snapshot', '.@__thumb', '@__thumb', '.@__desc', '.@__qini',
+                   '$RECYCLE.BIN', 'System Volume Information', '.Trash-*', '.Trashes', '.Spotlight-V100',
+                   '.fseventsd', '.TemporaryItems', '.AppleDouble', '@eaDir', '#recycle', '#snapshot',
+                   '*' + TEMP_SUFFIX)
 MODES = ('dry_run', 'sync')
 
 
@@ -75,7 +80,8 @@ class Config:
     force_polling: bool = False
     max_files: int = 2000000
     video_extensions: frozenset = VIDEO_EXTENSIONS
-    excludes: tuple = DEFAULT_EXCLUDES
+    excludes: tuple = DEFAULT_EXCLUDES + SYSTEM_EXCLUDES
+    follow_symlinks: bool = False      # 跟随指向文件的软链接（默认只镜像真实文件）
     verify_window_minutes: float = 30.0
     poll_seconds: float = 10.0
     compare_mode: str = 'tree'           # tree：导出目录树（cookie）；detail：逐目录 Open API 列表
@@ -205,8 +211,8 @@ class Config:
             exclude_list = DEFAULT_EXCLUDES
         else:
             exclude_list = tuple(e.strip() for e in str(excludes).replace(',', '\n').splitlines() if e.strip())
-            # 无论用户如何配置，插件自身的临时文件都必须保持排除。
-            exclude_list = tuple(dict.fromkeys(exclude_list + ('*' + TEMP_SUFFIX,)))
+        # 无论用户如何配置，插件自身的临时文件和系统回收站、缩略图目录都必须保持排除。
+        exclude_list = tuple(dict.fromkeys(exclude_list + SYSTEM_EXCLUDES))
         cron = ' '.join(str(raw.get('scan_cron') or DEFAULT_SCAN_CRON).split())
         if len(cron.split()) != 5:
             raise ValueError('定时扫描周期须为5段cron表达式，例如 %s' % DEFAULT_SCAN_CRON)
@@ -230,4 +236,5 @@ class Config:
             p115_cookie=str(raw.get('p115_cookie') or '').strip(), remote_refresh_hours=refresh,
             tree_timeout_minutes=tree_timeout, api_qps=qps, failure_threshold=threshold,
             cooldown_base_seconds=cool_base, cooldown_max_seconds=cool_max,
-            notify_enabled=flag('notify_enabled', True), scan_cron=cron, watch_mode=watch_mode)
+            notify_enabled=flag('notify_enabled', True), scan_cron=cron, watch_mode=watch_mode,
+            follow_symlinks=flag('follow_symlinks', False))

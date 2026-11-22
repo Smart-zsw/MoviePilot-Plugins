@@ -1,4 +1,6 @@
 """同步引擎边界情况测试：配置变更、上传校验与删除守卫等。"""
+import logging
+import shutil
 import time
 
 from sqlalchemy.orm import sessionmaker
@@ -192,20 +194,61 @@ def test_stray_copy_does_not_leave_upload_stuck_forever(harness):
     assert h.asset('S/e1.mkv')['b_state'] == 'synced'
 
 
-def test_vanished_file_on_other_device_than_its_ancestor_is_unknown(harness, monkeypatch):
-    """文件消失但所在设备与上级目录不同时视为未知，不删除。"""
+def stale_devices(h, monkeypatch):
+    """模拟目录与文件不在同一设备（存储池、或重新挂载后设备号已变）：上级目录的设备号总与记录不同。"""
+    monkeypatch.setattr(h.engine.fs, 'ancestor_device', lambda root, rel: -1)
+
+
+def test_files_vanished_from_an_emptied_mount_point_are_unknown(harness, caplog):
+    """子挂载断开：同一块盘上的已跟踪文件全部消失、只剩空目录时视为未知，不删除并提醒；其他盘上的文件不算数。"""
+    h = harness(**deleting())
+    h.write('keep.nfo', b'stays')
+    h.write('S/e1.nfo', b'meta')
+    h.write('S/e2.nfo', b'meta')
+    h.settle()
+    h.run()
+    h.repo.refresh_devices('tv', [('S/e1.nfo', 999), ('S/e2.nfo', 999)])  # S 是另一块盘（子挂载）
+    for name in ('e1.nfo', 'e2.nfo'):
+        (h.a / 'S' / name).unlink()  # S 成了空的挂载点
+    caplog.set_level(logging.WARNING, logger='localmirror115')
+    h.settle(scans=2)
+    h.run()
+    assert h.asset('S/e1.nfo')['a_state'] == 'present'
+    assert (h.c / 'S' / 'e1.nfo').exists() and h.remote.copies('/media/tv/S/e1.nfo')
+    assert h.repo.counts()['postponed'] == 2
+    assert '所在的盘似乎已断开' in caplog.text
+
+
+def test_storage_pool_or_renumbered_device_still_deletes(harness, monkeypatch):
+    """设备号对不上（存储池、重新挂载）但同目录其他文件仍在：是真实删除，照常同步。"""
     h = harness(**deleting())
     h.write('S/keep.nfo', b'stays')
     h.write('S/e1.nfo', b'meta')
     h.settle()
     h.run()
     (h.a / 'S' / 'e1.nfo').unlink()
-    monkeypatch.setattr(h.engine.fs, 'ancestor_device', lambda root, rel: -1)  # 如同空的挂载点
+    stale_devices(h, monkeypatch)
     h.settle(scans=2)
     h.run()
-    row = h.asset('S/e1.nfo')
-    assert row['a_state'] == 'present'
-    assert (h.c / 'S' / 'e1.nfo').exists()
+    assert h.asset('S/e1.nfo') is None
+    assert not (h.c / 'S' / 'e1.nfo').exists()
+    assert h.remote.copies('/media/tv/S/e1.nfo') == []
+    assert h.repo.counts()['postponed'] == 0
+
+
+def test_whole_show_deleted_with_stale_devices_still_deletes(harness, monkeypatch):
+    """整部剧目录被删、设备号又对不上时，看最近的现存上级目录（映射根）里其他文件仍在，照常同步删除。"""
+    h = harness(**deleting())
+    h.write('Other/keep.nfo', b'stays')
+    h.write('Show/S01/e1.nfo', b'meta')
+    h.settle()
+    h.run()
+    shutil.rmtree(h.a / 'Show')
+    stale_devices(h, monkeypatch)
+    h.settle(scans=2)
+    h.run()
+    assert h.asset('Show/S01/e1.nfo') is None
+    assert h.remote.copies('/media/tv/Show/S01/e1.nfo') == []
 
 
 def test_unexpected_scan_error_marks_root_unsafe(harness, monkeypatch):

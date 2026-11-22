@@ -10,13 +10,13 @@ def test_scan_reports_progress_while_walking_and_a_summary_after(harness):
     seen = []
     real = h.engine.fs.scan
 
-    def spy(root, limit, stop, excluded, progress=None):
+    def spy(root, limit, stop, excluded, progress=None, **extra):
         """包装真实扫描，在每次进度回调时记录扫描状态。"""
         def watch(count, folder):
             """转发进度并保存当前扫描状态副本。"""
             progress(count, folder)
             seen.append(dict(h.engine.status['scan']))
-        return real(root, limit, stop, excluded, progress=watch)
+        return real(root, limit, stop, excluded, progress=watch, **extra)
     h.engine.fs.scan = spy
     h.engine.scan_once()
     assert seen and all(s['step'] == 'walk' and s['mapping'] == 'tv' for s in seen)

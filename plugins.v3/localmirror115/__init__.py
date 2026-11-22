@@ -42,7 +42,7 @@ DEFAULTS = {
     'delete_delay_hours': 0,
     # 高级：文件规则
     'video_extensions': ','.join(e.lstrip('.') for e in DEFAULT_VIDEO_EXTENSIONS),
-    'excludes': '\n'.join(DEFAULT_EXCLUDES),
+    'excludes': '\n'.join(DEFAULT_EXCLUDES), 'follow_symlinks': False,
 }
 
 
@@ -196,7 +196,9 @@ def build_form():
         ]),
         _panel('文件规则', 'mdi-file-cog-outline', [
             _row(_area('video_extensions', '视频后缀', '逗号分隔；视频只上传115，不复制到STRM目录', 2)),
-            _row(_area('excludes', '排除规则', '每行一个文件或目录名通配，不区分大小写', 3)),
+            _row(_area('excludes', '排除规则',
+                       '每行一个文件或目录名通配，不区分大小写；NAS 回收站、缩略图等系统目录始终排除', 3)),
+            _row(_switch('follow_symlinks', '跟随软链接', '指向文件的软链接按目标文件同步；默认跳过软链接', md=6)),
         ]),
     ]}
     advanced_section = {'component': 'div', 'content': [
@@ -214,7 +216,7 @@ class LocalMirror115(_PluginBase):
     plugin_name = '本地115镜像'
     plugin_desc = '本地媒体库实时同步到115，并把非视频文件复制到STRM目录'
     plugin_icon = 'https://raw.githubusercontent.com/Smart-zsw/MoviePilot-Plugins/main/icons/localmirror115.png'
-    plugin_version = '1.0.0'
+    plugin_version = '1.0.1'
     plugin_author = 'Smart-zsw'
     author_url = 'https://github.com/Smart-zsw'
     plugin_config_prefix = 'localmirror115_'

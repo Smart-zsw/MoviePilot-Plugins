@@ -16,7 +16,7 @@ ROOT_LABELS = {
 }
 WATCH_LABELS = {
     'native_requested': ('性能模式', 'success'), 'polling': ('兼容模式', 'success'), 'disabled': ('监控已关闭', 'grey'),
-    'failed_scan_fallback_only': ('监控失败，仅靠扫描', 'error'),
+    'failed_retrying': ('监控出错，自动重试中', 'warning'),
 }
 
 INTRO = '本地文件有变化时实时同步：全部文件上传到115，非视频文件同时复制到STRM目录；比对只读取文件信息，不下载任何文件。'
@@ -140,7 +140,12 @@ def build_live(config, status, counts, notes=None):
         rows.append(live_row('mdi-magnify-scan', 'grey', '本地扫描', '等待首次扫描'))
     if counts.get('pending'):
         rows.append(live_row('mdi-timer-sand', 'info', '等待稳定', '%d 个变化正在等待文件写完' % counts['pending'],
-                             '%s 秒后处理' % int(config.settle_seconds)))
+                             '%s 秒后处理' % int(max((status.get('settle') or {}).values(),
+                                                  default=config.settle_seconds))))
+    if counts.get('postponed'):
+        rows.append(live_row('mdi-shield-alert-outline', 'warning', '暂缓确认',
+                             '%d 个变化暂时无法确认（本地目录或所在磁盘不可用），不会删除' % counts['postponed'],
+                             '每分钟复查'))
 
     building = _building(status)
     if building:
@@ -303,6 +308,8 @@ def build_dashboard(status, counts):
             facts.append(chip(text, 'primary', 'x-small', 'mdi-timer-outline'))
     if counts.get('pending'):
         facts.append(chip('等待稳定 %d' % counts['pending'], 'info', 'x-small', 'mdi-timer-sand'))
+    if counts.get('postponed'):
+        facts.append(chip('暂缓确认 %d' % counts['postponed'], 'warning', 'x-small', 'mdi-shield-alert-outline'))
     problems = sum(counts.get(t, {}).get(st, 0) for t in ('b', 'c') for st in ('error', 'conflict'))
     if problems:
         facts.append(chip('需要关注 %d' % problems, 'error', 'x-small', 'mdi-alert-circle-outline'))
@@ -381,7 +388,13 @@ def build_page(plugin_id, config, status, counts, rows, notes=None):
     index = status.get('remote_index') or {}
     limiter = status.get('limiter') or {}
     watch = set(status.get('watchers', {}).values())
-    watch_label = WATCH_LABELS.get(next(iter(watch)) if len(watch) == 1 else 'native_requested', ('监控', 'grey'))
+    # 有映射出错时优先提示；网络盘自动用轮询、本地盘用性能模式时显示“按目录自动选择”
+    if 'failed_retrying' in watch:
+        watch_label = WATCH_LABELS['failed_retrying']
+    elif watch == {'native_requested', 'polling'}:
+        watch_label = ('按目录自动选择', 'success')
+    else:
+        watch_label = WATCH_LABELS.get(next(iter(watch)) if len(watch) == 1 else 'native_requested', ('监控', 'grey'))
     problems = _sum(b, 'error', 'conflict') + _sum(c, 'error', 'conflict')
     on = lambda key: ('已开启', 'success') if sw.get(key) else ('已关闭', 'grey')
 

@@ -20,7 +20,7 @@ from .adapters import (CookieDeleter, RemoteUnknown, RemoteConflict, RateLimiter
 from .remote_index import RemoteIndex
 from .directory_delete import process_deleted_directories
 from .notify import Notifier, new_state
-from .filesystem import ReadOnlyFilesystem, LocalOutput, OutputError
+from .filesystem import ReadOnlyFilesystem, LocalOutput, Observation, OutputError, is_network_fs, mount_types
 from .persistence import FINAL, b_unseen, owned_ids, stable, tree_adopted
 from .log import (logger, where, size_text, note_label, error_detail, duration_text, MODE_LABEL, TARGET_LABEL,
                   TARGET_PLACE)
@@ -76,6 +76,10 @@ MAX_UNCONFIRMED_UPLOADS = 3
 NO_OP_PLANS = ('would_adopt_existing', 'would_adopt_identical', 'would_reconfirm_existing')  # 计划中目标已有相同文件
 AUDIT_SUSPECT = 500     # 快照核对中已同步却不在快照里的文件超过此数，视快照可疑，不据此重传
 BIG_UPLOAD = 4 << 30     # 不小于此大小（4 GB）的文件开始上传时也记一笔
+NETWORK_SETTLE = 60      # 网络盘的最短稳定观察秒数：属性有缓存，太短可能把写了一半的文件当成稳定
+CLOCK_JUMP = 300         # 系统时钟与单调时钟偏差超过此秒数视为时钟跳变
+CLOCK_HOLD = 600         # 时钟跳变后暂停删除的秒数
+WATCH_RETRY_MAX = 600    # 实时监控出错后重试的最长间隔秒数
 SCAN_RETRY = 600        # 全量扫描未完成时，隔多少秒自动重新扫描（只读本地，不访问115）
 DELETE_QUIET = 30       # 本地连续删除停下这么多秒后，再合并删除115上的对应文件
 DELETE_QUIET_MAX = 300  # 本地一直在删除时，单个文件最多等待的秒数
@@ -103,8 +107,12 @@ class SyncEngine:
         self.notifier = notifier or Notifier()
         self.remote = remote
         self.clock = clock
+        # 时钟跳变检测用的单调时钟；测试注入的假时钟同时充当单调时钟
+        self.monotonic = time.monotonic if clock is time.time else clock
+        self.clock_mark = (self.clock(), self.monotonic())
+        self.clock_hold_until = 0.0
         self.runtime = instance_state(data_path)
-        self.fs = ReadOnlyFilesystem()
+        self.fs = ReadOnlyFilesystem(config.follow_symlinks)
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.b_wake = threading.Event()
@@ -120,13 +128,20 @@ class SyncEngine:
         self.listings = {}
         self.listing_cleanup_at = 0.0
         self.scan_retry = {}    # 映射 key -> 全量扫描未完成后自动重扫的时间
+        self.device_warned = {}  # 映射 key -> 上次提醒的“所在磁盘似乎掉线”的文件数
+        self.remounted = set()  # 根目录刚重新挂载、尚待扫描核对的映射
+        self.watchers = {}      # 映射 key -> 监控线程（同一映射只保留一个）
+        types = mount_types([m.source for m in config.mappings])
+        self.fstype = {m.key: types[m.source] for m in config.mappings}  # 本地目录所在挂载的类型
+        self.settle = {m.key: max(config.settle_seconds, NETWORK_SETTLE) if is_network_fs(self.fstype[m.key])
+                       else config.settle_seconds for m in config.mappings}  # 各映射的稳定观察秒数：网络盘更长
         self.unchanged = collections.Counter()  # (目标, 映射, 说明) -> 本批无需实际操作的文件数，批末汇总成一条日志
         self.last_absence = {}  # 映射 key -> 最近一次确认有文件消失的时间
         self.quieting = set()   # 正在等待本地删除停下的映射
         self.status_lock = threading.RLock()
         self.status = {'mode': config.mode, 'running': False, 'watchers': {}, 'roots': {}, 'root_detail': {},
                        'last_event': None, 'last_scan': None, 'last_error': None,
-                       'b_busy': None, 'c_busy': None,
+                       'b_busy': None, 'c_busy': None, 'settle': self.settle,
                        'scan': None, 'last_scan_info': None,
                        'switches': {k: getattr(config, k) for k in (
                            'watch_enabled', 'transfer_event_enabled', 'scan_enabled', 'adopt_existing',
@@ -185,9 +200,12 @@ class SyncEngine:
         return True
 
     def _start_watcher(self, mapping):
-        """引擎已启动且开启实时监控时，为该映射启动一个监控线程。"""
-        if self.config.watch_enabled and self.threads and not self.stop_event.is_set():
+        """引擎已启动且开启实时监控时，为该映射启动监控线程（已有在运行的则不重复启动）。"""
+        current = self.watchers.get(mapping.key)
+        if (self.config.watch_enabled and self.threads and not self.stop_event.is_set()
+                and (current is None or not current.is_alive())):
             thread = threading.Thread(target=self._watch, args=(mapping,), daemon=True, name='localmirror115')
+            self.watchers[mapping.key] = thread
             self.threads.append(thread)
             thread.start()
 
@@ -207,8 +225,9 @@ class SyncEngine:
         """接收一批路径变化：目录改为局部扫描，文件入队等待稳定（整批一次写入）；返回各路径是否属于某映射。"""
         if self.stop_event.is_set():
             return [False] * len(paths)
-        batch = []
-        results = [self._hint_one(Path(path), origin, batch) for path in paths]
+        batch, healthy = [], {}
+        with self.fs.batch():
+            results = [self._hint_one(Path(path), origin, batch, healthy) for path in paths]
         if batch:
             self.repository.enqueue_many(batch)
             for key, relative, observation, _, _ in batch:
@@ -223,8 +242,9 @@ class SyncEngine:
             self.wake.set()
         return results
 
-    def _hint_one(self, path, origin, batch):
-        """处理一个路径变化：目录安排局部扫描，文件的观测加入 batch；路径属于某映射时返回 True。"""
+    def _hint_one(self, path, origin, batch, healthy):
+        """处理一个路径变化：目录安排局部扫描，文件的观测加入 batch；路径属于某映射时返回 True。
+        healthy 为本批各映射源根是否健康的缓存：观测只是入队，稳定后 tick 还会再确认，不必逐个探测。"""
         if not path.is_absolute() or '..' in path.parts:
             return False
         for m in self.config.mappings:
@@ -240,11 +260,14 @@ class SyncEngine:
             if not encodable(relative):
                 return True
             self.notifier.touch()
-            observation = self.fs.observe(m.source, relative)
+            if m.key not in healthy:
+                healthy[m.key] = self.fs.healthy(m.source)
+            observation = self.fs.observe(m.source, relative, checked=healthy[m.key]) if healthy[m.key] else \
+                Observation('unknown', reason='source_root_unavailable_or_changed')
             if observation.status == 'directory':
                 self.request_subtree(m, relative)
                 return True
-            batch.append((m.key, relative, observation.to_dict(), self.clock() + self.config.settle_seconds, origin))
+            batch.append((m.key, relative, observation.to_dict(), self.clock() + self.settle[m.key], origin))
             return True
         return False
 
@@ -307,7 +330,7 @@ class SyncEngine:
     def _note_scanned(self, mapping):
         """记录该映射本次全量扫描的基准与根目录身份，供短暂重启时沿用。"""
         try:
-            identity = list(self.fs._root_identity(mapping.source))
+            identity = list(self.fs.identity(mapping.source))
         except OSError:
             return
         scans = dict(self.scan_record.get('scans') or {})
@@ -328,7 +351,7 @@ class SyncEngine:
                     or entry.get('baseline') != self._baseline(m) or not self.repository.has_records(m.key)):
                 continue  # 数据库被清空（如重置插件数据）时扫描记录已不可信，必须重新扫描
             try:
-                if list(self.fs._root_identity(m.source)) != entry.get('identity'):
+                if list(self.fs.identity(m.source)) != entry.get('identity'):
                     continue
             except OSError:
                 continue
@@ -358,12 +381,14 @@ class SyncEngine:
                                    'expected': None, 'dir': relative, 'queued': 0, 'started': self.clock(),
                                    'scope': relative}
         try:
+            unreadable = []
             manifest = self.fs.scan(mapping.source, self.config.max_files, self.stop_event, self.config.excluded,
                                     progress=lambda seen, folder: self._scan_progress(seen=seen, dir=folder),
-                                    start=relative)
+                                    start=relative, unreadable=unreadable)
             known = {k: v for k, v in self.repository.fingerprints(mapping.key, prefix).items()
                      if not self.config.excluded(k)}
-            queued, _ = self._enqueue_diff(mapping, manifest, known, 'directory')
+            self._warn_unreadable(mapping, unreadable)
+            queued, _ = self._enqueue_diff(mapping, manifest, known, 'directory', unreadable)
             logger.info('【扫描】目录有变化，已重新扫描：%s（现有 %d 个文件，其中 %d 个有变化）',
                         where(mapping.key, relative), len(manifest), queued)
         except InterruptedError:
@@ -376,10 +401,15 @@ class SyncEngine:
                 self.status['scan'] = None
         self.wake.set()
 
-    def _enqueue_diff(self, mapping, manifest, known, origin):
-        """把扫描清单与已知记录的差异（新增、变化、消失）分批加入稳定队列。
+    def _enqueue_diff(self, mapping, manifest, known, origin, unreadable=()):
+        """把扫描清单与已知记录的差异（新增、变化、消失）分批加入稳定队列；全量扫描时顺带更新已变化的设备号。
+        读不了的目录（unreadable）里的已知文件不算消失；读不到属性的项（unknown）不入队。
         返回 (入队数, 跳过的无法编码文件名数)；插件停止时抛出 InterruptedError。"""
-        due, batch, queued, skipped = self.clock() + self.config.settle_seconds, [], 0, 0
+        due, batch, queued, skipped = self.clock() + self.settle[mapping.key], [], 0, 0
+        blind = tuple(directory + '/' for directory in unreadable)
+        # 设备号只在全量扫描时整理：局部扫描只看到一部分文件，判断不了整盘是否重新编号，
+        # 先改掉一部分反而会让随后的全量扫描认不出重新编号。moved：记录的设备号 -> 这些文件现在报告的设备号集合
+        full, devices, moved = origin == 'scan', [], {}
 
         def flush():
             """写入当前这一批并更新扫描进度。"""
@@ -393,10 +423,21 @@ class SyncEngine:
             for relative, observation in manifest.items():
                 if not encodable(relative):
                     skipped += 1  # 无法编码的文件名跳过，不阻塞整批
-                elif not self._unchanged(relative, observation, known.get(relative)):
+                    continue
+                if observation.status == 'unknown':
+                    continue
+                old = known.get(relative)
+                if not self._unchanged(relative, observation, old):
                     yield relative, observation
-            for relative in known.keys() - manifest.keys():
-                yield relative, self.fs.observe(mapping.source, relative)
+                elif full and old[4] != observation.dev:
+                    devices.append((relative, observation.dev))  # 设备号变了（重新挂载、存储池）：只更新记录
+                if full and observation.status == 'present' and old and old[4] is not None:
+                    moved.setdefault(old[4], set()).add(observation.dev)
+            gone = [relative for relative in known.keys() - manifest.keys() if not relative.startswith(blind)]
+            ok = bool(gone) and self.fs.healthy(mapping.source)  # 只确认一次源根；tick 处理前还会再确认
+            with self.fs.batch():
+                for relative in gone:
+                    yield relative, self.fs.observe(mapping.source, relative, checked=ok)
 
         for relative, observation in changed():
             if self.stop_event.is_set():
@@ -407,14 +448,42 @@ class SyncEngine:
                 flush()
         if batch:
             flush()
+        if full:
+            # 全量扫描中，记录在某设备号下的现存文件全部换成了同一个新设备号：是整盘重新编号（重新挂载），
+            # 把这个设备号下的全部记录（含已消失的）一起改过去，已删除的文件才能和同盘的其他文件对上。
+            # 掉盘时它的文件根本不在清单里，不会触发；存储池里个别文件换盘时其余文件仍报告旧号，也不会触发。
+            for old, new in moved.items():
+                if len(new) == 1 and old not in new:
+                    new = next(iter(new))
+                    logger.info('【扫描】[%s] 本地磁盘的设备号已从 %s 变为 %s（重新挂载），已更新记录', mapping.key, old, new)
+                    self.repository.renumber_device(mapping.key, old, new)
+            if devices:
+                self.repository.refresh_devices(mapping.key, devices)
         return queued, skipped
+
+    def _warn_unreadable(self, mapping, unreadable):
+        """有读不了的子目录时提醒：其中的文件既不同步也不删除。"""
+        if unreadable:
+            logger.warning('【扫描】[%s] %d 个目录无法读取（权限不足或已断开），其中的文件暂不同步也不删除：%s%s',
+                           mapping.key, len(unreadable), '、'.join(unreadable[:3]), ' 等' if len(unreadable) > 3 else '')
+
+    def _check_remount(self, mapping, manifest, known):
+        """根目录重新挂载后的第一次扫描：已知文件至少一半仍在且大小一致，才确认还是原来的媒体库；否则抛出 OSError。"""
+        present = [(relative, size) for relative, (state, size, *_) in known.items() if state == 'present']
+        if present:
+            same = sum(1 for relative, size in present
+                       if relative in manifest and manifest[relative].status == 'present'
+                       and manifest[relative].size == size)
+            if same * 2 < len(present):
+                raise OSError('root_content_mismatch')
+        self.remounted.discard(mapping.key)
 
     def _unchanged(self, relative, observation, known):
         """扫描结果与已记录的指纹和分类都一致时返回 True（无需入队）。
         分类按当前视频后缀判断，后缀设置变化后旧记录会重新入队。"""
         if observation.status != 'present' or known is None:
             return False
-        state, size, mtime_ns, kind = known
+        state, size, mtime_ns, kind, _ = known
         fp = observation.fingerprint
         return (state == 'present' and size == fp['size'] and mtime_ns == fp['mtime_ns']
                 and kind == ('video' if self.config.is_video(relative) else 'meta'))
@@ -443,17 +512,18 @@ class SyncEngine:
                                        'started': started}
             if self.status['roots'].get(m.key) == 'unavailable' and not self._bind_late(m):
                 continue
-            if not self.fs.healthy(m.source) and self.fs.rebind_placeholder(m.source):
-                self._root(m.key, 'awaiting_scan', 'placeholder_replaced_by_mount')
-                self._start_watcher(m)
+            self._accept_remount(m)
             began = self.clock()
             logger.info('【扫描】[%s] 开始全量扫描：%s（只读取文件属性）', m.key, m.source)
             try:
                 # 先读已知记录：遍历期间新增并已稳定的文件不在清单里，不能被误算为“消失”。
                 known = self.repository.fingerprints(m.key)
                 self._scan_progress(expected=len(known) or None)
+                unreadable = []
                 manifest = self.fs.scan(m.source, self.config.max_files, self.stop_event, self.config.excluded,
-                                        progress=lambda seen, folder: self._scan_progress(seen=seen, dir=folder))
+                                        progress=lambda seen, folder: self._scan_progress(seen=seen, dir=folder),
+                                        unreadable=unreadable)
+                self._warn_unreadable(m, unreadable)
                 self._scan_progress(step='compare', seen=len(manifest), dir='')
                 files += len(manifest)
                 excluded = {k for k in known if self.config.excluded(k)}
@@ -464,8 +534,10 @@ class SyncEngine:
                 # 意外为空的目录树绝不能作为删除基准。
                 if not manifest and known:
                     raise OSError('empty_tree_requires_manual_review')
+                if m.key in self.remounted:
+                    self._check_remount(m, manifest, known)
                 gone = sum(1 for k, (state, *_) in known.items() if state == 'present' and k not in manifest)
-                queued, skipped = self._enqueue_diff(m, manifest, known, 'scan')
+                queued, skipped = self._enqueue_diff(m, manifest, known, 'scan', unreadable)
                 changes += queued
                 with self.status_lock:
                     self.status.setdefault('skipped_names', {})[m.key] = skipped
@@ -504,44 +576,55 @@ class SyncEngine:
     @_activity
     def tick(self):
         """把已稳定的观测转入 Asset 行，仍在变化的重新入队，源不健康的延后；取满一批时返回 True。"""
+        self._check_clock()
         tasks = self.repository.due(self.clock(), limit=BATCH * 2)
         if not tasks:
             return False
         self.notifier.touch()
         observed, healthy = [], {}
-        for task in tasks:
-            if self.stop_event.is_set():
-                return False
-            mapping = self.mapping_by_id.get(task['mapping'])
-            if mapping is None:
-                continue
-            if mapping.key not in healthy:  # 每批每个映射只确认一次源根，不逐个文件确认
-                healthy[mapping.key] = self.fs.healthy(mapping.source)
-            current = self.fs.observe(mapping.source, task['relative'], checked=True) \
-                if healthy[mapping.key] else None
-            observed.append((task, mapping, current))
+        with self.fs.batch():
+            for task in tasks:
+                if self.stop_event.is_set():
+                    return False
+                mapping = self.mapping_by_id.get(task['mapping'])
+                if mapping is None:
+                    continue
+                if mapping.key not in healthy:  # 每批每个映射只确认一次源根，不逐个文件确认
+                    healthy[mapping.key] = self.fs.healthy(mapping.source)
+                current = self.fs.observe(mapping.source, task['relative'], checked=True) \
+                    if healthy[mapping.key] else None
+                observed.append((task, mapping, current))
         # 批次结束再确认一次：期间源根掉线的映射，这一批观测全部作废（视为未知），绝不推断为缺失
         lost = {key for key, ok in healthy.items() if ok and not self.fs.healthy(self.mapping_by_id[key].source)}
         if lost:
             observed = [(task, mapping, None if mapping.key in lost else current)
                         for task, mapping, current in observed]
-        devices = self.repository.devices([(task['mapping'], task['relative']) for task, _, current in observed
-                                           if current is not None and current.status == 'missing_candidate'])
-        ready, postponed, rechecks = [], [], []
-        due = self.clock() + self.config.settle_seconds
+        vanished = [task for task, _, current in observed
+                    if current is not None and current.status == 'missing_candidate']
+        devices = self.repository.devices([(task['mapping'], task['relative']) for task in vanished])
+        gone = {task['relative'] for task in vanished}
+        ready, postponed, rechecks, alive, held = [], [], [], {}, collections.Counter()
         for task, mapping, current in observed:
             if current is not None and current.status == 'missing_candidate' and not self._same_device(
-                    mapping, task['relative'], devices.get((task['mapping'], task['relative']))):
-                current = None  # 原所在的子挂载已不在：视为未知而不是删除
+                    mapping, task['relative'], devices.get((task['mapping'], task['relative'])), alive, gone):
+                current = None  # 所在磁盘似乎已掉线：视为未知而不是删除
+                held[mapping.key] += 1
             if current is None or current.status == 'unknown':
                 postponed.append(task)  # 源不健康：延后再看，绝不推断为缺失
             elif stable(current.to_dict()) != stable(task['observation']):
-                rechecks.append((mapping.key, task['relative'], current.to_dict(), due, 'recheck'))
+                rechecks.append((mapping.key, task['relative'], current.to_dict(),
+                                 self.clock() + self.settle[mapping.key], 'recheck'))
             else:
                 kind = 'video' if self.config.is_video(task['relative']) else 'meta'
                 ready.append((task, kind, current.to_dict()))
         if postponed:
-            self.repository.postpone(postponed, self.clock() + max(60.0, self.config.settle_seconds))
+            self.repository.postpone(postponed, self.clock() + max([60.0] + [self.settle[task['mapping']]
+                                                                             for task in postponed]))
+        for key, count in held.items():
+            if self.device_warned.get(key) != count:  # 数量变化时才提醒，避免每分钟重复
+                logger.warning('【删除保护】[%s] %d 个消失的文件所在的盘似乎已断开（同一块盘上的其他文件也都找不到了），'
+                               '暂不删除，每分钟复查；恢复后会按实际情况处理', key, count)
+        self.device_warned = dict(held)
         if rechecks:
             self.repository.enqueue_many(rechecks)
         settled = 0
@@ -575,11 +658,22 @@ class SyncEngine:
         fp = observation.fingerprint
         return {'size': fp['size'], 'mtime_ns': fp['mtime_ns']} == asset['a_fp']
 
-    def _same_device(self, mapping, relative, device):
-        """最近的现存祖先目录仍在原设备上时缺失才成立，防止子挂载卸载被当成删除。"""
+    def _same_device(self, mapping, relative, device, alive=None, gone=()):
+        """确认文件消失不是因为它所在的磁盘或挂载断开（断开时绝不能当作删除）。
+        最近的现存上级目录与记录的设备号相同时成立；不同时（存储池里同一目录的文件分在不同的盘上、
+        FUSE/网络盘重新挂载后设备号重编）看记录在同一设备号下的其他已跟踪文件是否还有任何一个存在：
+        有就说明这组文件所在的盘在线，消失是真实删除；一个都不在（掉盘、卸载，连挂载点都没了也一样）才视为断开。
+        alive 为本轮“设备号 -> 是否在线”的缓存，gone 为本轮同时消失、不能用来证明在线的路径。"""
         if device is None:
             return True
-        return self.fs.ancestor_device(mapping.source, relative) == device
+        if self.fs.ancestor_device(mapping.source, relative) == device:
+            return True
+        alive = {} if alive is None else alive
+        key = (mapping.key, device)
+        if key not in alive:
+            alive[key] = any(self.fs.is_file(mapping.source, other)
+                             for other in self.repository.present_on_device(mapping.key, device, exclude=gone))
+        return alive[key]
 
     def _defer(self, target, asset, seconds=DEFER):
         """本地文件仍在变化：把该目标的处理推迟若干秒（正常现象，不写日志）。"""
@@ -605,12 +699,30 @@ class SyncEngine:
             return 'delete_disabled'
         if not (self.config.delete_b_enabled if target == 'b' else self.config.delete_c_enabled):
             return 'delete_%s_disabled' % target
+        if self.monotonic() < self.clock_hold_until:
+            return 'clock_jumped'
         if not self.fs.healthy(mapping.source):
             return 'source_root_unhealthy'
         root_state = self.status['roots'].get(mapping.key)
         if root_state != 'ready':
             return 'root_' + str(root_state)
         return None
+
+    def _check_clock(self):
+        """检测系统时钟跳变（NAS 刚开机尚未校时、手动改时间）：与单调时钟偏差超过 CLOCK_JUMP 秒时，
+        把已排好的到期时间整体平移、暂停删除 CLOCK_HOLD 秒，避免任务被推迟到很久以后或提前删除。"""
+        wall, mono = self.clock(), self.monotonic()
+        last_wall, last_mono = self.clock_mark
+        self.clock_mark = (wall, mono)
+        jump = wall - (last_wall + (mono - last_mono))
+        if abs(jump) <= CLOCK_JUMP:
+            return
+        logger.warning('【时钟】系统时间%s了 %s，已调整待处理任务的时间，%s内暂停同步删除', '回退' if jump < 0 else '前跳',
+                       duration_text(abs(jump)), duration_text(CLOCK_HOLD))
+        if jump < 0:
+            self.repository.shift_schedule(jump, wall)
+            self.scan_retry = {key: due + jump for key, due in self.scan_retry.items()}
+        self.clock_hold_until = mono + CLOCK_HOLD
 
     def _error(self, target, asset, note, state='error', detail=''):
         """记录一次处理失败并按退避安排重试；首次失败或冲突时发出通知。detail 为异常详情，只写日志。"""
@@ -1375,7 +1487,7 @@ class SyncEngine:
         held = self.repository.clear_holds()
         if held:
             logger.info('【删除】旧版本暂扣的 %d 个删除将按正常流程处理（115上删除的文件进入回收站，可找回）', held)
-        self.repository.reset_stability(self.clock(), self.config.settle_seconds)
+        self.repository.reset_stability(self.clock(), self.settle)
         self.repository.park_idle()
 
     def _stability(self):
@@ -1406,7 +1518,7 @@ class SyncEngine:
                 self.config.delete_enabled and self.config.delete_c_enabled))
         with self.status_lock:
             unhealthy = sum(state not in ('ready',) for state in self.status['roots'].values())
-            watcher_errors = sum(state == 'failed_scan_fallback_only' for state in self.status['watchers'].values())
+            watcher_errors = sum(state == 'failed_retrying' for state in self.status['watchers'].values())
         return {'busy': bool(work['pending'] or work['active']),
                 'deferred': work['deferred'] + unhealthy + watcher_errors}
 
@@ -1423,6 +1535,7 @@ class SyncEngine:
             if self.clock() - beat >= HEARTBEAT:
                 beat = self.clock()
                 self._save_record()
+                self._detect_remounts()
             due = [key for key, at in list(self.scan_retry.items()) if self.clock() >= at]
             if due:
                 for key in due:
@@ -1430,6 +1543,29 @@ class SyncEngine:
                 self.request_scan(due, reason='上次全量扫描未完成，自动重新扫描')
             if self.scan_requested.wait(0.5) and not self.stop_event.is_set():
                 self._scan_pending()
+
+    def _detect_remounts(self):
+        """心跳时发现根目录换了身份（重新挂载、NFS/SMB 重连）：接受新身份并安排重新扫描核对。"""
+        for m in self.config.mappings:
+            if self.status['roots'].get(m.key) != 'unavailable' and self._accept_remount(m):
+                self.request_scan([m.key], reason='本地目录重新挂载过')
+
+    def _accept_remount(self, mapping):
+        """根目录可以访问但身份变了时接受新身份，返回是否接受：先暂停删除再换身份，
+        之后的全量扫描核对已知文件大半仍在（_check_remount）才恢复删除。"""
+        try:
+            current = self.fs.identity(mapping.source)
+        except OSError:
+            return False  # 还不可访问：等它恢复
+        if current == self.fs.roots.get(str(mapping.source)):
+            return False
+        self._root(mapping.key, 'awaiting_scan', 'root_remounted')
+        self.remounted.add(mapping.key)
+        if not self.fs.rebind(mapping.source):
+            return False  # 刚好又变了或不可访问：保持暂停删除，下次再接
+        logger.warning('【扫描】[%s] 本地目录重新挂载过（目录身份已变），重新扫描并核对已知文件后再恢复删除', mapping.key)
+        self._start_watcher(mapping)
+        return True
 
     @_activity
     def _scan_pending(self):
@@ -1456,35 +1592,59 @@ class SyncEngine:
             self._last_error('scan', 'scan_failed')
 
     def _watch(self, mapping):
-        """监控线程：实时监控映射源目录并交给 hint；失败时改为依靠全量扫描。"""
-        try:
-            from watchfiles import watch, Change
+        """监控线程：实时监控映射源目录并交给 hint。网络盘与远程 FUSE 自动用轮询（跨主机的文件事件传不过来）；
+        出错时性能模式先降级为轮询，之后按退避间隔自动重试，期间补一次全量扫描，不会就此停止监控。"""
+        from watchfiles import watch, Change
+        polling = self.config.force_polling or is_network_fs(self.fstype.get(mapping.key))
+        if polling and not self.config.force_polling:
+            logger.info('【监控】[%s] 本地目录在网络盘或远程挂载上（%s），自动使用兼容模式（轮询）',
+                        mapping.key, self.fstype.get(mapping.key))
+        failures = 0  # 轮询也出错的连续次数，决定重试等待
+        while not self.stop_event.is_set():
             with self.status_lock:
-                self.status['watchers'][mapping.key] = 'polling' if self.config.force_polling else 'native_requested'
+                self.status['watchers'][mapping.key] = 'polling' if polling else 'native_requested'
             logger.info('【监控】[%s] 开始实时监控：%s（%s）', mapping.key, mapping.source,
-                        '兼容模式，每 %g 秒轮询' % self.config.poll_seconds if self.config.force_polling else '性能模式，系统文件事件')
-            for changes in watch(mapping.source, stop_event=self.stop_event, recursive=True,
-                                 watch_filter=None, force_polling=self.config.force_polling,
-                                 poll_delay_ms=int(self.config.poll_seconds * 1000),
-                                 debounce=300, step=50, rust_timeout=500):
-                # 目录的修改事件只是子项变化带来的 mtime 更新，子项自有事件。
-                paths = [path for kind, path in changes if not (kind == Change.modified and Path(path).is_dir())]
-                try:
-                    self.hint_many(paths, 'filesystem')
-                except Exception as error:  # 例如数据库短暂繁忙：继续监控并补扫这些变化所在的目录
-                    logger.warning('【监控】处理 %d 个变化失败，稍后补扫所在目录（%s）', len(paths), type(error).__name__)
-                    for parent in {Path(path).parent for path in paths}:
-                        if parent != mapping.source and mapping.source in parent.parents:
-                            self.request_subtree(mapping, parent.relative_to(mapping.source).as_posix())
-                        else:
-                            self.request_scan([mapping.key], reason='处理文件变化失败')
-        except Exception as error:
-            if self.stop_event.is_set():
-                return
-            logger.error('【监控】[%s] 实时监控失败：%s，改为靠全量扫描发现变化', mapping.key, error, exc_info=True)
-            with self.status_lock:
-                self.status['watchers'][mapping.key] = 'failed_scan_fallback_only'
-            self.request_scan(reason='映射 %s 的实时监控失败' % mapping.key)
+                        '兼容模式，每 %g 秒轮询' % self.config.poll_seconds if polling else '性能模式，系统文件事件')
+            try:
+                for changes in watch(mapping.source, stop_event=self.stop_event, recursive=True,
+                                     watch_filter=None, force_polling=polling,
+                                     poll_delay_ms=int(self.config.poll_seconds * 1000),
+                                     debounce=300, step=50, rust_timeout=500, ignore_permission_denied=True):
+                    failures = 0
+                    # 目录的修改事件只是子项变化带来的 mtime 更新，子项自有事件。
+                    paths = [path for kind, path in changes if not (kind == Change.modified and Path(path).is_dir())]
+                    try:
+                        self.hint_many(paths, 'filesystem')
+                    except Exception as error:  # 例如数据库短暂繁忙：继续监控并补扫这些变化所在的目录
+                        logger.warning('【监控】处理 %d 个变化失败，稍后补扫所在目录（%s）', len(paths),
+                                       type(error).__name__)
+                        for parent in {Path(path).parent for path in paths}:
+                            if parent != mapping.source and mapping.source in parent.parents:
+                                self.request_subtree(mapping, parent.relative_to(mapping.source).as_posix())
+                            else:
+                                self.request_scan([mapping.key], reason='处理文件变化失败')
+                return  # 正常结束只因收到停止信号
+            except Exception as error:
+                if self.stop_event.is_set():
+                    return
+                text = str(error)
+                hint = ''
+                if 'inotify' in text.lower() or ('watch' in text.lower() and 'limit' in text.lower()):
+                    hint = '；目录太多超过了系统的 inotify 上限，可在宿主机执行 sysctl -w fs.inotify.max_user_watches=524288'
+                with self.status_lock:
+                    self.status['watchers'][mapping.key] = 'failed_retrying'
+                if not polling:
+                    polling = True
+                    logger.warning('【监控】[%s] 性能模式出错（%s）%s，改用兼容模式（轮询）继续监控', mapping.key,
+                                   error_detail(error), hint)
+                else:
+                    wait = min(backoff(failures), WATCH_RETRY_MAX)
+                    failures += 1
+                    logger.warning('【监控】[%s] 实时监控出错（%s）%s，%s后重试', mapping.key, error_detail(error), hint,
+                                   duration_text(wait))
+                    if self.stop_event.wait(wait):
+                        return
+                self.request_scan([mapping.key], reason='实时监控中断期间可能漏掉变化')
 
     def start(self):
         """启动各工作与监控线程，并沿用上次扫描结果或安排启动扫描。"""
@@ -1499,11 +1659,10 @@ class SyncEngine:
         if self.index is not None:
             targets.append((self._indexer, ()))
             self.index_requested.set()
-        if self.config.watch_enabled:
-            targets += [(self._watch, (m,)) for m in self.config.mappings if self.fs.healthy(m.source)]
-        else:
+        if not self.config.watch_enabled:
             for m in self.config.mappings:
                 self.status['watchers'][m.key] = 'disabled'
+        healthy = [m for m in self.config.mappings if self.fs.healthy(m.source)]
         resumed = self._resumable()
         for key in resumed:
             self._root(key, 'ready')
@@ -1523,6 +1682,8 @@ class SyncEngine:
             thread = threading.Thread(target=target, args=args, daemon=True, name='localmirror115')
             self.threads.append(thread)
             thread.start()
+        for mapping in healthy:
+            self._start_watcher(mapping)
 
     def stop(self, timeout=10):
         """停止引擎并在超时内等待线程退出；全部退出时返回 True。"""

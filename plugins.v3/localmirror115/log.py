@@ -92,7 +92,10 @@ NOTE_LABELS = {
     'source_root_unhealthy': '本地实体库不可用或已变化', 'root_awaiting_scan': '等待首次扫描完成',
     'root_scan_incomplete_or_unsafe': '扫描异常，暂停删除', 'root_unavailable': '本地实体库不可用',
     'empty_tree_requires_manual_review': '本地目录树意外为空，需要人工确认', 'scan_file_limit_exceeded': '文件数超过上限',
-    'scan_stopped': '扫描被中止', 'scan_enqueue_stopped': '扫描被中止', 'placeholder_replaced_by_mount': '挂载已就绪，等待重新扫描',
+    'scan_stopped': '扫描被中止', 'scan_enqueue_stopped': '扫描被中止',
+    'root_remounted': '本地目录重新挂载过，核对已知文件后恢复删除', 'root_content_mismatch': '重新挂载后内容与记录不符，暂停删除',
+    'clock_jumped': '系统时间刚跳变过，暂停删除', 'mount_probe_timeout': '本地目录无响应（挂载可能挂死）',
+    'symlink_target_missing': '软链接指向的文件不存在', 'renamed_case_only': '只改了文件名大小写',
     # 状态页“最近错误”
     'worker_failed_retrying': '处理线程出错，稍后自动重试', 'index_failed': '115快照处理出错',
     'scan_failed': '扫描出错', 'prepare_failed': '启动准备出错',

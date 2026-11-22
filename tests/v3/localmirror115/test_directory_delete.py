@@ -218,8 +218,9 @@ def test_guards_keep_entire_group_out_of_file_deletion(harness, guard):
     vanished(h)
     if guard == 'root':
         h.engine.status['roots']['tv'] = 'awaiting_scan'
-    elif guard == 'device':
+    elif guard == 'device':  # 挂载断开：上级目录换了设备，目录里也找不到其他文件
         h.engine.fs.ancestor_device = lambda *args: -1
+        h.engine.fs.is_file = lambda *args: False
     elif guard == 'pending':
         h.repo.enqueue_many([('tv', 'Show/new.mkv', {'status': 'missing_candidate'}, h.clock() + 50, 'filesystem')])
     elif guard == 'future':

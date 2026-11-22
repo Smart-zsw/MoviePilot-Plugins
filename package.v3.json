@@ -3,13 +3,14 @@
     "name": "本地115镜像",
     "description": "本地媒体库实时同步到115，并把非视频文件复制到STRM目录",
     "labels": "云盘,同步,STRM",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/Smart-zsw/MoviePilot-Plugins/main/icons/localmirror115.png",
     "author": "Smart-zsw",
     "level": 1,
     "system_version": ">=3.2.5",
     "release": true,
     "history": {
+      "v1.0.1": "修复存储池、FUSE 类挂载下部分已删除文件不同步删除、一直显示“等待稳定”的问题；适配更多 NAS 与服务器环境：重新挂载后自动接上并核对内容，网络盘自动改用轮询并延长稳定观察，挂死的挂载不再卡住插件，读不了的目录只跳过不删除，监控出错自动降级重试，系统时间跳变自动校正，NAS 回收站等系统目录始终排除，可选跟随软链接，支持只改大小写的重命名。",
       "v1.0.0": "首次发布：本地文件变化实时上传115、非视频文件复制到STRM目录、受保护的同步删除；115目录树/逐个比对两种方式，试运行默认开启。"
     }
   }

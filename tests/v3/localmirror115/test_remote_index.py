@@ -362,9 +362,9 @@ def test_undecodable_name_does_not_block_the_batch(harness, monkeypatch):
     h.write('S/good.nfo', b'x')
     real_scan = h.engine.fs.scan
 
-    def scan(root, limit, stop, excluded, progress=None):
+    def scan(root, limit, stop, excluded, progress=None, **extra):
         """在真实扫描结果中加入一个无法解码的文件名。"""
-        manifest = real_scan(root, limit, stop, excluded)
+        manifest = real_scan(root, limit, stop, excluded, **extra)
         from app.plugins.localmirror115.filesystem import Observation
         manifest['S/bad\udcff.nfo'] = Observation('present', {'size': 1, 'mtime_ns': 1})
         return manifest

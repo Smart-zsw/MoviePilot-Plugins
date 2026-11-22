@@ -18,10 +18,10 @@ def test_new_directory_is_scanned_alone(harness):
     calls = []
     real = h.engine.fs.scan
 
-    def spy(root, limit, stop, excluded, progress=None, start=''):
+    def spy(root, limit, stop, excluded, progress=None, start='', **extra):
         """记录每次扫描的起始子目录后执行真实扫描。"""
         calls.append(start)
-        return real(root, limit, stop, excluded, progress=progress, start=start)
+        return real(root, limit, stop, excluded, progress=progress, start=start, **extra)
     h.engine.fs.scan = spy
     h.write('New/Season 1/e1.nfo', b'y')
     h.write('New/Season 1/e1.mkv', b'video')

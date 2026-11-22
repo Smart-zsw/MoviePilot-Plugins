@@ -3,6 +3,7 @@
 表名带 schema 版本：变更列时新建表或提供 get_database_migrations() 迁移，create_all 不会修改已有表。
 """
 import json
+import random
 import threading
 from contextlib import contextmanager
 from typing import Optional
@@ -26,7 +27,8 @@ class Asset(Base):
     __tablename__ = 'lm115_asset_v1'
     __table_args__ = (UniqueConstraint('mapping', 'relative', name='uq_lm115_asset_v1_path'),
                       Index('ix_lm115_asset_v1_b_next', 'b_next', 'id'),
-                      Index('ix_lm115_asset_v1_c_next', 'c_next', 'id'))
+                      Index('ix_lm115_asset_v1_c_next', 'c_next', 'id'),
+                      Index('ix_lm115_asset_v1_dev', 'mapping', 'a_dev'))  # 按设备号取样确认磁盘在线
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     mapping: Mapped[str] = mapped_column(String(64))
     revision: Mapped[str] = mapped_column(String(64))                 # A 根目录标识
@@ -331,11 +333,12 @@ class Repository:
             _reset_target(row, 'c')
             row.c_rev = self.revision_c[key]
 
-    def reset_stability(self, now, settle_seconds):
-        """重启后重新计时：停机期间无法证明排队文件保持稳定；旧 revision 的行直接删除。"""
+    def reset_stability(self, now, settle):
+        """重启后重新计时：停机期间无法证明排队文件保持稳定；旧 revision 的行直接删除。settle 为各映射的稳定秒数。"""
         with self.transaction() as s:
             s.execute(delete(Pending).where(not_(self.active(Pending))))
-            s.execute(update(Pending).where(self.active(Pending)).values(due=now + settle_seconds))
+            for key, seconds in settle.items():
+                s.execute(update(Pending).where(self.active(Pending), Pending.mapping == key).values(due=now + seconds))
 
     def park_idle(self):
         """把无事可做的行的 next 停放到 PARKED，使工作队列只扫描待处理行；返回停放数量。"""
@@ -360,18 +363,40 @@ class Repository:
 
     # ---- 资产 --------------------------------------------------------------
     def fingerprints(self, mapping, prefix=None):
-        """返回扫描比对用的 {relative: (a_state, size, mtime_ns, kind)}，含 missing 行；prefix 限定目录。
+        """返回扫描比对用的 {relative: (a_state, size, mtime_ns, kind, a_dev)}，含 missing 行；prefix 限定目录。
         用元组而非字典：30 万行时内存差别明显。"""
         with self.reading() as s:
-            query = select(Asset.relative, Asset.a_state, Asset.a_fp, Asset.kind).where(
+            query = select(Asset.relative, Asset.a_state, Asset.a_fp, Asset.kind, Asset.a_dev).where(
                 Asset.mapping == mapping, Asset.revision == self.revision[mapping])
             if prefix:
                 query = query.where(_under(s, Asset.relative, prefix))
             out = {}
-            for relative, state, fp, kind in s.execute(query):
+            for relative, state, fp, kind, dev in s.execute(query):
                 fp = decode(fp) or {}
-                out[relative] = (state, fp.get('size'), fp.get('mtime_ns'), kind)
+                out[relative] = (state, fp.get('size'), fp.get('mtime_ns'), kind, dev)
             return out
+
+    def refresh_devices(self, mapping, items):
+        """更新内容未变、但设备号已变（重新挂载、存储池调整）的已跟踪文件 [(relative, dev)]。"""
+        table = Asset.__table__
+        with self.transaction() as s:
+            s.connection().execute(update(table).where(
+                table.c.mapping == mapping, table.c.revision == self.revision[mapping],
+                table.c.relative == bindparam('rel')).values(a_dev=bindparam('dev')),
+                [{'rel': relative, 'dev': dev} for relative, dev in items])
+
+    def renumber_device(self, mapping, old, new):
+        """整盘重新编号：把记录在设备号 old 下的全部行（含已消失的）改为 new。"""
+        with self.transaction() as s:
+            s.execute(update(Asset).where(Asset.mapping == mapping, Asset.revision == self.revision[mapping],
+                                          Asset.a_dev == old).values(a_dev=new))
+
+    def shift_schedule(self, delta, now):
+        """系统时钟回退 delta（负数）秒后，把排在将来的到期时间同样提前，避免任务被推迟很久。"""
+        with self.transaction() as s:
+            s.execute(update(Pending).where(Pending.due > now).values(due=Pending.due + delta))
+            for column in (Asset.b_next, Asset.c_next):
+                s.execute(update(Asset).where(column > now, column < PARKED).values({column: column + delta}))
 
     def forget(self, mapping, relatives):
         """停止跟踪已被排除的路径；不会删除任何位置的文件。"""
@@ -492,6 +517,25 @@ class Repository:
                             row.b_fp, row.b_state, row.b_next, row.b_attempts = None, '', 0, 0
                             row.b_note, row.updated_at = 'directory_delete_recheck', now
         return done
+
+    def present_on_device(self, mapping, device, exclude=(), limit=20, spots=4):
+        """取记录在同一设备号下、仍为 present 的若干已跟踪路径（不含 exclude），用来确认这组文件所在的盘仍在线。
+        从 spots 个随机位置起按 id 各取一段（走设备号索引），不必为随机排序读遍整组；同一目录的文件 id 相邻，
+        分几处取样，免得一段恰好落在刚被整体删除的目录里。"""
+        exclude, found = set(exclude), {}
+        per = -(-limit // spots) + len(exclude)
+        query = select(Asset.id, Asset.relative).where(
+            Asset.mapping == mapping, Asset.a_dev == device, Asset.revision == self.revision[mapping],
+            Asset.a_state == 'present').order_by(Asset.id)
+        with self.reading() as s:
+            top = s.scalar(select(func.max(Asset.id))) or 0
+            for _ in range(spots):
+                start = random.randint(0, top)
+                rows = s.execute(query.where(Asset.id >= start).limit(per)).all()
+                if len(rows) < per:  # 到了末尾：从头接着取
+                    rows += s.execute(query.where(Asset.id < start).limit(per - len(rows))).all()
+                found.update((row_id, relative) for row_id, relative in rows if relative not in exclude)
+        return list(found.values())[:limit]
 
     def devices(self, paths):
         """返回 {(mapping, relative): 记录的 A 设备号}。"""
@@ -667,7 +711,7 @@ class Repository:
 
     # ---- 状态 --------------------------------------------------------------
     def counts(self):
-        """状态统计：B/C 各状态计数及总数、missing 和排队数。"""
+        """状态统计：B/C 各状态计数及总数、missing、等待稳定数，以及因本地状态无法确认而暂缓的数量。"""
         with self.reading() as s:
             out = {}
             for target, col in (('b', Asset.b_state), ('c', Asset.c_state)):
@@ -678,7 +722,10 @@ class Repository:
             out['total'], out['missing'] = s.execute(select(
                 func.count(), func.count(case((Asset.a_state == 'missing', 1))))
                 .select_from(Asset).where(self.active(Asset))).one()
-            out['pending'] = s.scalar(select(func.count()).select_from(Pending).where(self.active(Pending)))
+            postponed = Pending.origin == 'postponed'
+            out['pending'], out['postponed'] = s.execute(select(
+                func.count(case((~postponed, 1))), func.count(case((postponed, 1))))
+                .select_from(Pending).where(self.active(Pending))).one()
             return out
 
     def note_counts(self):
