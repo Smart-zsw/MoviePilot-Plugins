@@ -76,7 +76,7 @@ class Config:
     delete_c_enabled: bool = True
     delete_delay_hours: float = 0.0
     settle_seconds: float = 5.0
-    scan_seconds: float = 900.0
+    scan_seconds: float = 900.0         # 被阻止的删除多久复查一次（不在设置界面中，旧配置沿用）
     force_polling: bool = False
     max_files: int = 2000000
     video_extensions: frozenset = VIDEO_EXTENSIONS
@@ -182,7 +182,7 @@ class Config:
         limit = int(raw.get('max_files', 2000000))
         delay = float(raw.get('delete_delay_hours', 0))
         if not 0.05 <= settle <= 300 or scan > 86400 or not 1 <= limit <= 10000000:
-            raise ValueError('稳定观察间隔、扫描间隔或文件数上限超出范围')
+            raise ValueError('稳定观察间隔、删除复查间隔或文件数上限超出范围')
         if not 0 <= delay <= 24 * 90:
             raise ValueError('删除延迟超出范围（0～2160 小时）')
         verify_window = max(5.0, float(raw.get('verify_window_minutes', 30)))

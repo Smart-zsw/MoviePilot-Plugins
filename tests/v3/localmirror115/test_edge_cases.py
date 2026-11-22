@@ -220,7 +220,7 @@ def test_files_vanished_from_an_emptied_mount_point_are_unknown(harness, caplog)
 
 
 def test_storage_pool_or_renumbered_device_still_deletes(harness, monkeypatch):
-    """设备号对不上（存储池、重新挂载）但同目录其他文件仍在：是真实删除，照常同步。"""
+    """上级目录设备号对不上（存储池、重新挂载）但同一设备号下的其他已跟踪文件仍在：是真实删除，照常同步。"""
     h = harness(**deleting())
     h.write('S/keep.nfo', b'stays')
     h.write('S/e1.nfo', b'meta')
@@ -237,7 +237,7 @@ def test_storage_pool_or_renumbered_device_still_deletes(harness, monkeypatch):
 
 
 def test_whole_show_deleted_with_stale_devices_still_deletes(harness, monkeypatch):
-    """整部剧目录被删、设备号又对不上时，看最近的现存上级目录（映射根）里其他文件仍在，照常同步删除。"""
+    """整部剧目录被删、上级目录设备号又对不上时，同一设备号下的其他已跟踪文件（Other/keep.nfo）仍在，照常同步删除。"""
     h = harness(**deleting())
     h.write('Other/keep.nfo', b'stays')
     h.write('Show/S01/e1.nfo', b'meta')

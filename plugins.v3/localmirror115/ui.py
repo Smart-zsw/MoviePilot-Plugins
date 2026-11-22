@@ -10,7 +10,7 @@ STATE_LABELS = {
     'absent': ('无需处理', 'grey'),
 }
 ROOT_LABELS = {
-    'ready': ('正常', 'success'), 'awaiting_scan': ('等待首次扫描', 'info'),
+    'ready': ('正常', 'success'), 'awaiting_scan': ('等待扫描', 'info'),
     'scan_incomplete_or_unsafe': ('扫描异常，暂停删除', 'error'),
     'unavailable': ('目录不可用', 'error'),
 }
@@ -144,8 +144,8 @@ def build_live(config, status, counts, notes=None):
                                                   default=config.settle_seconds))))
     if counts.get('postponed'):
         rows.append(live_row('mdi-shield-alert-outline', 'warning', '暂缓确认',
-                             '%d 个变化暂时无法确认（本地目录或所在磁盘不可用），不会删除' % counts['postponed'],
-                             '每分钟复查'))
+                             '%d 个变化暂时无法确认（本地目录或磁盘不可用、软链接目标不存在等），不会删除'
+                             % counts['postponed'], '约每分钟复查'))
 
     building = _building(status)
     if building:
@@ -421,7 +421,8 @@ def build_page(plugin_id, config, status, counts, rows, notes=None):
                          [list_item(*item, last=i == len(items) - 1) for i, item in enumerate(items)])
 
     # ---- 路径映射 ----
-    snap_state = {'building': ('快照生成中', 'info'), 'ready': ('快照就绪', 'success'), 'failed': ('快照失败', 'error')}
+    snap_state = {'building': ('快照生成中', 'info'), 'ready': ('快照就绪', 'success'), 'failed': ('快照失败', 'error'),
+                  'invalidated': ('快照待重建', 'info')}
     mapping_body = []
     for m in config.mappings:
         r_label, r_color = ROOT_LABELS.get(status['roots'].get(m.key), (status['roots'].get(m.key) or '未知', 'grey'))
@@ -438,7 +439,7 @@ def build_page(plugin_id, config, status, counts, rows, notes=None):
         if (status.get('root_detail') or {}).get(m.key):
             warnings.append(status['root_detail'][m.key])
         if info.get('note'):
-            warnings.append(info['note'])
+            warnings.append(note_label(info['note']))
         if audit.get('state') == 'suspect':
             warnings.append('快照疑似异常：%d/%d 个已同步文件不在115中，已忽略本次核对' % (audit['missing'], audit['synced']))
         elif audit.get('missing'):

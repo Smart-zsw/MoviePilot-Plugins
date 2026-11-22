@@ -147,7 +147,7 @@ def build_form():
             _select('watch_mode', '监控模式', [
                 {'title': '性能模式', 'value': 'fast'},
                 {'title': '兼容模式', 'value': 'compatibility'}],
-                '网络挂载选兼容模式', md=3, narrow=True),
+                '网络盘会自动改用轮询；识别不到时再选兼容模式', md=3, narrow=True),
             _switch('transfer_event_enabled', 'MP整理完成事件', '整理完成后立即处理', offset=1),
             _switch('scan_enabled', '定时兜底扫描', '万一漏掉变化时补齐，正常用不到；周期在高级设置'))]),
         _section('115比对', 'mdi-cloud-search-outline', [_row(
@@ -170,8 +170,8 @@ def build_form():
     ]
     advanced = {'component': 'VExpansionPanels', 'props': {'variant': 'accordion', 'multiple': True}, 'content': [
         _panel('扫描与监控细节', 'mdi-tune-variant', [
-            _row(_field('poll_seconds', '轮询间隔（秒）', '仅兼容模式；文件越多建议越大'),
-                 _field('settle_seconds', '稳定观察间隔（秒）', '文件这么久不变才处理')),
+            _row(_field('poll_seconds', '轮询间隔（秒）', '兼容模式与自动轮询的网络盘使用；文件越多建议越大'),
+                 _field('settle_seconds', '稳定观察间隔（秒）', '文件这么久不变才处理；网络盘至少60秒')),
             _row(_col(4, {'component': 'VCronField', 'props': {
                      'model': 'scan_cron', 'label': '兜底扫描周期', 'placeholder': DEFAULT_SCAN_CRON,
                      'hint': 'cron表达式，默认每周三、六凌晨4点；需打开上方的定时兜底扫描', 'persistent-hint': True,
@@ -183,7 +183,7 @@ def build_form():
                                               'class': 'mb-3',
                 'text': '115访问过于频繁会触发风控。默认值适用于几千到几十万文件的库，一般不需要修改。'}},
             _row(_field('api_qps', '每秒最多请求数', '所有115请求共用'),
-                 _field('failure_threshold', '连续失败几次进入冷却'),
+                 _field('failure_threshold', '5分钟内失败几次进入冷却'),
                  _field('cooldown_base_seconds', '首次冷却（秒）', '之后每次翻倍')),
             _row(_field('cooldown_max_seconds', '冷却上限（秒）'),
                  _field('remote_refresh_hours', '快照刷新间隔（小时）', '用于首次判断和反向核对'),

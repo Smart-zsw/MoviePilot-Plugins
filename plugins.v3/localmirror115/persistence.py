@@ -392,11 +392,19 @@ class Repository:
                                           Asset.a_dev == old).values(a_dev=new))
 
     def shift_schedule(self, delta, now):
-        """系统时钟回退 delta（负数）秒后，把排在将来的到期时间同样提前，避免任务被推迟很久。"""
+        """系统时钟跳变 delta 秒后调整记录的时间，只会让处理推迟、不会提前：
+        回退（delta 为负）时，排在将来的到期时间和消失时间同样提前，避免任务被推迟很久；
+        前跳时，消失时间同样后移，删除延迟从校时后重新起算，不会因时间突然变大而提前删除。"""
         with self.transaction() as s:
-            s.execute(update(Pending).where(Pending.due > now).values(due=Pending.due + delta))
-            for column in (Asset.b_next, Asset.c_next):
-                s.execute(update(Asset).where(column > now, column < PARKED).values({column: column + delta}))
+            if delta < 0:
+                s.execute(update(Pending).where(Pending.due > now).values(due=Pending.due + delta))
+                for column in (Asset.b_next, Asset.c_next):
+                    s.execute(update(Asset).where(column > now, column < PARKED).values({column: column + delta}))
+                s.execute(update(Asset).where(Asset.missing_since > now)
+                          .values(missing_since=Asset.missing_since + delta))
+            else:
+                s.execute(update(Asset).where(Asset.missing_since.is_not(None))
+                          .values(missing_since=Asset.missing_since + delta))
 
     def forget(self, mapping, relatives):
         """停止跟踪已被排除的路径；不会删除任何位置的文件。"""
@@ -654,7 +662,6 @@ class Repository:
                         results[i] = True
                     continue
                 # 驱动不支持批量行数或有行未匹配：读回这一组逐项确认
-
                 check = {r.id: r for r in s.execute(select(table).where(
                     table.c.id.in_([items[i][0]['id'] for i in indexes])))}
                 for i in indexes:

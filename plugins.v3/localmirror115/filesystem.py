@@ -15,7 +15,7 @@ from .config import TEMP_SUFFIX
 PROBE_TIMEOUT = 10  # 根目录探测的最长秒数：挂死的 NFS/FUSE 挂载会让 stat 永远不返回
 # 文件事件跨主机传不过来、或属性有缓存的挂载类型：自动改用轮询并加长稳定期（与 MoviePilot 的判断一致）
 NETWORK_FS = ('nfs', 'nfs4', 'cifs', 'smb3', 'smbfs', 'sshfs', 'fuse', '9p', 'davfs', 'ceph', 'glusterfs')
-LOCAL_FUSE = ('fuse.shfs', 'fuseblk')  # Unraid 阵列与 NTFS/exFAT 等本地 FUSE，不算网络盘
+LOCAL_FUSE = ('fuse.shfs', 'fuse.mergerfs', 'fuseblk')  # Unraid 阵列、mergerfs 存储池、NTFS/exFAT 等本地 FUSE
 
 
 def mount_types(paths):
@@ -42,7 +42,7 @@ def mount_types(paths):
 
 
 def is_network_fs(fstype):
-    """是否为网络盘或远程 FUSE 挂载（极空间 zfuse、Unraid shfs 等本地 FUSE 不算）。"""
+    """是否为网络盘或远程 FUSE 挂载（极空间 zfuse、Unraid shfs、mergerfs 等本地 FUSE 不算）。"""
     if not fstype or fstype in LOCAL_FUSE or fstype.startswith('zfuse'):
         return False
     return fstype.split('.')[0] in NETWORK_FS
@@ -122,7 +122,7 @@ class ScanEntry:
     __slots__ = ('status', 'size', 'mtime_ns', 'ctime_ns', 'dev', 'ino', 'reason')
 
     def __init__(self, status, info=None, reason=''):
-        """由 stat 结果构造；info 为 None 表示没有指纹（冲突项）。"""
+        """由 stat 结果构造；info 为 None 表示没有指纹（冲突或未知项）。"""
         self.status, self.reason = status, reason
         if info is None:
             self.size = self.mtime_ns = self.ctime_ns = self.dev = self.ino = None
@@ -171,12 +171,8 @@ class ReadOnlyFilesystem:
             self.local.names = None
 
     def bind_root(self, root: Path):
-        """绑定源根并记录其 (设备号, inode)；已绑定根的身份变化时抛出 OSError（由 rebind 处理）。"""
-        current = self.identity(root)
-        previous = self.roots.get(str(root))
-        if previous is not None and previous != current:
-            raise OSError('本地实体库根目录已被替换，需要重新初始化')
-        self._remember(root, current)
+        """绑定尚未绑定的源根并记录其 (设备号, inode)；之后身份变化由 rebind 处理。"""
+        self._remember(root, self.identity(root))
 
     def _remember(self, root, identity):
         """记下根身份，以及它是否为空占位目录。"""
@@ -194,7 +190,10 @@ class ReadOnlyFilesystem:
             return False
         if current == self.roots.get(str(root)):
             return False
-        self._remember(root, current)
+        try:
+            self._remember(root, current)
+        except OSError:
+            return False  # 能 stat 但列不了目录、或刚好又挂死：下次再接
         return True
 
     @staticmethod
@@ -280,14 +279,15 @@ class ReadOnlyFilesystem:
         except OSError:
             return None
 
-    def is_file(self, root, relative):
-        """路径当前是否为普通文件（开启跟随软链接时也接受指向文件的软链接）。只用来证明所在的盘在线，
-        比 observe 轻：不检查上级软链接和名字大小写，悬空链接也算不在。"""
+    def on_device(self, root, relative, device):
+        """路径当前是否为位于设备 device 上的普通文件（开启跟随软链接时看目标文件），用来证明这块盘在线。
+        必须核对设备号：掉盘后有程序往空挂载点写回同名文件时，它落在别的盘上，不能当作证明。"""
         path = root.joinpath(*PurePosixPath(relative).parts)
         try:
-            return stat.S_ISREG((os.stat(path) if self.follow_symlinks else os.lstat(path)).st_mode)
+            info = os.stat(path) if self.follow_symlinks else os.lstat(path)
         except OSError:
             return False
+        return stat.S_ISREG(info.st_mode) and info.st_dev == device
 
     def scan(self, root, limit, stop, excluded=lambda relative: False, progress=None, start='', unreadable=None):
         """返回扫描清单 {相对路径: ScanEntry}；根目录不可用等整体问题抛出异常，不完整的清单绝不作为基线。
@@ -329,7 +329,6 @@ class ReadOnlyFilesystem:
         if not self.healthy(root):
             raise OSError('扫描期间本地实体库根目录发生变化')
         return result
-
 
     def _entry(self, item):
         """生成一个扫描项：普通文件带指纹；软链接按设置跟随或记为冲突；读不了的记为未知。"""

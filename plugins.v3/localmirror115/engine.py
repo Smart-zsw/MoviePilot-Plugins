@@ -7,9 +7,9 @@ import collections
 import contextlib
 import dataclasses
 from functools import wraps
+import copy
 import json
 import os
-import copy
 import sys
 import threading
 import time
@@ -131,8 +131,8 @@ class SyncEngine:
         self.device_warned = {}  # 映射 key -> 上次提醒的“所在磁盘似乎掉线”的文件数
         self.remounted = set()  # 根目录刚重新挂载、尚待扫描核对的映射
         self.watchers = {}      # 映射 key -> 监控线程（同一映射只保留一个）
-        types = mount_types([m.source for m in config.mappings])
-        self.fstype = {m.key: types[m.source] for m in config.mappings}  # 本地目录所在挂载的类型
+        fstypes = mount_types([m.source for m in config.mappings])
+        self.fstype = {m.key: fstypes[m.source] for m in config.mappings}  # 本地目录所在挂载的类型
         self.settle = {m.key: max(config.settle_seconds, NETWORK_SETTLE) if is_network_fs(self.fstype[m.key])
                        else config.settle_seconds for m in config.mappings}  # 各映射的稳定观察秒数：网络盘更长
         self.unchanged = collections.Counter()  # (目标, 映射, 说明) -> 本批无需实际操作的文件数，批末汇总成一条日志
@@ -140,13 +140,10 @@ class SyncEngine:
         self.quieting = set()   # 正在等待本地删除停下的映射
         self.status_lock = threading.RLock()
         self.status = {'mode': config.mode, 'running': False, 'watchers': {}, 'roots': {}, 'root_detail': {},
-                       'last_event': None, 'last_scan': None, 'last_error': None,
-                       'b_busy': None, 'c_busy': None, 'settle': self.settle,
+                       'last_error': None, 'b_busy': None, 'c_busy': None, 'settle': self.settle,
                        'scan': None, 'last_scan_info': None,
-                       'switches': {k: getattr(config, k) for k in (
-                           'watch_enabled', 'transfer_event_enabled', 'scan_enabled', 'adopt_existing',
-                           'copy_enabled', 'upload_enabled', 'delete_enabled', 'delete_b_enabled',
-                           'delete_c_enabled')}}
+                       'switches': {k: getattr(config, k) for k in (  # 状态页“运行状态”显示的开关
+                           'upload_enabled', 'copy_enabled', 'delete_enabled', 'scan_enabled')}}
         self.mapping_by_id = {m.key: m for m in config.mappings}
         self.done_times = {'b': collections.deque(maxlen=2000), 'c': collections.deque(maxlen=2000)}
         self.passes = {'b': [0, None], 'c': [0, None]}  # 已处理文件数 / 本轮开始时间
@@ -177,8 +174,7 @@ class SyncEngine:
                 # 删除前必须先由本引擎完成一次成功扫描。
                 self.status['roots'][m.key] = 'awaiting_scan'
             except OSError as error:
-                self.status['roots'][m.key] = 'unavailable'
-                self.status['root_detail'][m.key] = str(error)[:200]
+                self._root(m.key, 'unavailable', str(error)[:200])
                 logger.warning('【启动】[%s] 本地目录不可用，挂载后会自动接上：%s（%s）', m.key, m.source, error)
 
     def _cooldown(self, wait):
@@ -235,10 +231,6 @@ class SyncEngine:
                 if (observation['status'] in ('missing_candidate', 'unknown')
                         and self.repository.has_descendants(key, relative)):
                     self.request_subtree(self.mapping_by_id[key], relative)
-            key, relative = batch[-1][:2]
-            with self.status_lock:
-                self.status['last_event'] = {'mapping': key, 'relative': relative, 'origin': origin,
-                                             'at': self.clock()}
             self.wake.set()
         return results
 
@@ -341,6 +333,7 @@ class SyncEngine:
         """返回可沿用上次全量扫描的映射：插件只短暂停止且扫描依据与根目录身份未变。"""
         # 只认同一进程内的重载：进程整体重启期间的变化实时监控看不到。
         stopped_at = self.runtime.stopped_at
+        self._note_remounts_while_stopped()
         if (self.scan_record.get('scan_pending') or stopped_at is None
                 or not 0 <= self.clock() - stopped_at <= SHORT_RESTART):
             return set()
@@ -357,6 +350,20 @@ class SyncEngine:
                 continue
             keys.add(m.key)
         return keys
+
+    def _note_remounts_while_stopped(self):
+        """根目录身份与上次全量扫描时记下的不同（插件停止期间重新挂载过）：同样要等扫描核对内容后才恢复删除。"""
+        for m in self.config.mappings:
+            stored = ((self.scan_record.get('scans') or {}).get(m.key) or {}).get('identity')
+            if not stored or self.status['roots'].get(m.key) != 'awaiting_scan':
+                continue
+            try:
+                current = list(self.fs.identity(m.source))
+            except OSError:
+                continue
+            if current != stored:
+                self._root(m.key, 'awaiting_scan', 'root_remounted')
+                self.remounted.add(m.key)
 
     @_activity
     def request_subtree(self, mapping, relative):
@@ -378,8 +385,7 @@ class SyncEngine:
         prefix = relative + '/'
         with self.status_lock:
             self.status['scan'] = {'mapping': mapping.key, 'position': 1, 'mappings': 1, 'step': 'walk', 'seen': 0,
-                                   'expected': None, 'dir': relative, 'queued': 0, 'started': self.clock(),
-                                   'scope': relative}
+                                   'expected': None, 'dir': relative, 'queued': 0, 'scope': relative}
         try:
             unreadable = []
             manifest = self.fs.scan(mapping.source, self.config.max_files, self.stop_event, self.config.excluded,
@@ -408,8 +414,11 @@ class SyncEngine:
         due, batch, queued, skipped = self.clock() + self.settle[mapping.key], [], 0, 0
         blind = tuple(directory + '/' for directory in unreadable)
         # 设备号只在全量扫描时整理：局部扫描只看到一部分文件，判断不了整盘是否重新编号，
-        # 先改掉一部分反而会让随后的全量扫描认不出重新编号。moved：记录的设备号 -> 这些文件现在报告的设备号集合
+        # 先改掉一部分反而会让随后的全量扫描认不出重新编号。
+        # moved：记录的设备号 -> 这些文件现在报告的设备号集合；recorded：记录的设备号 -> 其下已跟踪的记录数
         full, devices, moved = origin == 'scan', [], {}
+        recorded = collections.Counter(row[4] for row in known.values() if row[4] is not None) if full else {}
+        present = collections.Counter()
 
         def flush():
             """写入当前这一批并更新扫描进度。"""
@@ -433,6 +442,7 @@ class SyncEngine:
                     devices.append((relative, observation.dev))  # 设备号变了（重新挂载、存储池）：只更新记录
                 if full and observation.status == 'present' and old and old[4] is not None:
                     moved.setdefault(old[4], set()).add(observation.dev)
+                    present[old[4]] += 1
             gone = [relative for relative in known.keys() - manifest.keys() if not relative.startswith(blind)]
             ok = bool(gone) and self.fs.healthy(mapping.source)  # 只确认一次源根；tick 处理前还会再确认
             with self.fs.batch():
@@ -449,11 +459,12 @@ class SyncEngine:
         if batch:
             flush()
         if full:
-            # 全量扫描中，记录在某设备号下的现存文件全部换成了同一个新设备号：是整盘重新编号（重新挂载），
+            # 全量扫描中，记录在某设备号下的文件至少一半仍在、且全部换成了同一个新设备号：是整盘重新编号（重新挂载），
             # 把这个设备号下的全部记录（含已消失的）一起改过去，已删除的文件才能和同盘的其他文件对上。
-            # 掉盘时它的文件根本不在清单里，不会触发；存储池里个别文件换盘时其余文件仍报告旧号，也不会触发。
+            # 掉盘时它的文件不在清单里；掉盘后有程序往空挂载点写回个别同名文件时达不到一半；
+            # 存储池里个别文件换盘时其余文件仍报告旧号：都不会触发。
             for old, new in moved.items():
-                if len(new) == 1 and old not in new:
+                if len(new) == 1 and old not in new and present[old] * 2 >= recorded[old]:
                     new = next(iter(new))
                     logger.info('【扫描】[%s] 本地磁盘的设备号已从 %s 变为 %s（重新挂载），已更新记录', mapping.key, old, new)
                     self.repository.renumber_device(mapping.key, old, new)
@@ -508,8 +519,7 @@ class SyncEngine:
                 break
             with self.status_lock:
                 self.status['scan'] = {'mapping': m.key, 'position': position, 'mappings': len(mappings),
-                                       'step': 'walk', 'seen': 0, 'expected': None, 'dir': '', 'queued': 0,
-                                       'started': started}
+                                       'step': 'walk', 'seen': 0, 'expected': None, 'dir': '', 'queued': 0}
             if self.status['roots'].get(m.key) == 'unavailable' and not self._bind_late(m):
                 continue
             self._accept_remount(m)
@@ -564,7 +574,6 @@ class SyncEngine:
                 self._forget_scan(m.key)
                 self.scan_retry[m.key] = self.clock() + SCAN_RETRY
         with self.status_lock:
-            self.status['last_scan'] = self.clock()
             self.status['scan'] = None
             self.status['last_scan_info'] = {'started': started, 'seconds': self.clock() - started,
                                              'files': files, 'changes': changes}
@@ -671,13 +680,13 @@ class SyncEngine:
         alive = {} if alive is None else alive
         key = (mapping.key, device)
         if key not in alive:
-            alive[key] = any(self.fs.is_file(mapping.source, other)
+            alive[key] = any(self.fs.on_device(mapping.source, other, device)
                              for other in self.repository.present_on_device(mapping.key, device, exclude=gone))
         return alive[key]
 
-    def _defer(self, target, asset, seconds=DEFER):
-        """本地文件仍在变化：把该目标的处理推迟若干秒（正常现象，不写日志）。"""
-        self.repository.record(target, asset, **{target + '_next': self.clock() + seconds})
+    def _defer(self, target, asset):
+        """本地文件仍在变化：把该目标的处理推迟 DEFER 秒（正常现象，不写日志）。"""
+        self.repository.record(target, asset, **{target + '_next': self.clock() + DEFER})
 
     def _delete_blocker(self, target, mapping, asset, root=False):
         """返回阻止删除这个条目的原因；允许删除时返回 None。
@@ -709,8 +718,8 @@ class SyncEngine:
         return None
 
     def _check_clock(self):
-        """检测系统时钟跳变（NAS 刚开机尚未校时、手动改时间）：与单调时钟偏差超过 CLOCK_JUMP 秒时，
-        把已排好的到期时间整体平移、暂停删除 CLOCK_HOLD 秒，避免任务被推迟到很久以后或提前删除。"""
+        """检测系统时钟跳变（NAS 刚开机尚未校时、手动改时间）：与单调时钟偏差超过 CLOCK_JUMP 秒时调整记录的时间
+        （回退时到期时间提前，前跳时消失时间后移，见 shift_schedule），并暂停删除 CLOCK_HOLD 秒。"""
         wall, mono = self.clock(), self.monotonic()
         last_wall, last_mono = self.clock_mark
         self.clock_mark = (wall, mono)
@@ -719,9 +728,10 @@ class SyncEngine:
             return
         logger.warning('【时钟】系统时间%s了 %s，已调整待处理任务的时间，%s内暂停同步删除', '回退' if jump < 0 else '前跳',
                        duration_text(abs(jump)), duration_text(CLOCK_HOLD))
+        self.repository.shift_schedule(jump, wall)
         if jump < 0:
-            self.repository.shift_schedule(jump, wall)
             self.scan_retry = {key: due + jump for key, due in self.scan_retry.items()}
+        self.last_absence = {key: at + jump for key, at in self.last_absence.items()}
         self.clock_hold_until = mono + CLOCK_HOLD
 
     def _error(self, target, asset, note, state='error', detail=''):
@@ -774,7 +784,7 @@ class SyncEngine:
     def _later_fields(self, target, state, note):
         """生成稍后处理需写入的字段。"""
         # 计划只因文件或配置变化而变，两者都会立即触发重评，故每天复查一次；
-        # 被阻止的删除取决于时间或根目录状态，按扫描间隔复查。
+        # 被阻止的删除取决于时间或根目录状态，每 scan_seconds（默认 15 分钟）复查。
         wait = PLANNED_RECHECK if state == 'planned' else self.config.scan_seconds
         return {target + '_state': state, target + '_note': note, target + '_next': self.clock() + wait,
                 'updated_at': self.clock()}
@@ -1532,10 +1542,13 @@ class SyncEngine:
         while not self.stop_event.is_set():
             self.notifier.flush_alerts()
             self.flush_notifications()
-            if self.clock() - beat >= HEARTBEAT:
+            if not 0 <= self.clock() - beat < HEARTBEAT:  # 时钟回退后也照常心跳
                 beat = self.clock()
                 self._save_record()
-                self._detect_remounts()
+                try:
+                    self._detect_remounts()
+                except Exception:  # 绝不能让扫描线程退出
+                    logger.error('【扫描】检查本地目录是否重新挂载时出错', exc_info=True)
             due = [key for key, at in list(self.scan_retry.items()) if self.clock() >= at]
             if due:
                 for key in due:
@@ -1552,7 +1565,7 @@ class SyncEngine:
 
     def _accept_remount(self, mapping):
         """根目录可以访问但身份变了时接受新身份，返回是否接受：先暂停删除再换身份，
-        之后的全量扫描核对已知文件大半仍在（_check_remount）才恢复删除。"""
+        之后的全量扫描核对已知文件至少一半仍在且大小一致（_check_remount）才恢复删除。"""
         try:
             current = self.fs.identity(mapping.source)
         except OSError:

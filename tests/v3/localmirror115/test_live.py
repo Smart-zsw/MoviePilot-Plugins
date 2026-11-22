@@ -52,7 +52,7 @@ def test_page_shows_live_scan_and_explanation(harness):
     status = h.engine.snapshot()
     status['running'] = True
     status['scan'] = {'mapping': 'tv', 'position': 1, 'mappings': 1, 'step': 'walk', 'seen': 50,
-                      'expected': 100, 'dir': 'S/Season 1', 'queued': 0, 'started': status['now']}
+                      'expected': 100, 'dir': 'S/Season 1', 'queued': 0}
     page = str(build_page('LocalMirror115', h.config, status, h.repo.counts(), [], h.repo.note_counts()))
     assert '扫描中 tv' in page and '50 / 约100' in page and 'S/Season 1' in page
     assert '不下载任何文件' in page and '同步任务' not in page

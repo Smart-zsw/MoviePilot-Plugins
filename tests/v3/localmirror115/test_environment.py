@@ -1,6 +1,7 @@
 """各种安装环境的适配：重新挂载、网络盘、读不了的目录、挂死的挂载、时钟跳变、软链接与不区分大小写的盘。"""
 import logging
 import os
+import shutil
 import threading
 
 import pytest
@@ -228,7 +229,7 @@ def test_watcher_error_falls_back_to_polling_and_rescans(harness, monkeypatch, c
 
 
 def test_hung_mount_probe_times_out_and_recovers(tmp_path):
-    """挂死的挂载：探测超时报错，挂死期间不再为同一路径起新线程；探测返回后恢复正常。"""
+    """挂死的挂载：探测超时报错，挂死期间同一路径的探测立即报错、不再排队；探测返回后恢复正常。"""
     from app.plugins.localmirror115.filesystem import ProbeTimeout, probe
     release = threading.Event()
     with pytest.raises(ProbeTimeout):
@@ -332,3 +333,72 @@ def test_case_checks_list_each_directory_once_per_batch(harness, monkeypatch):
     assert len(calls) == 1
     fs.observe(h.a, 'S/e0.nfo', checked=True)
     assert len(calls) == 2
+
+
+def test_file_written_back_into_an_offline_mount_point_does_not_trigger_deletes(harness):
+    """子挂载掉线后，MP 往空挂载点写回一个同名 nfo：它落在别的盘上，既不算整盘重新编号，也不能证明盘在线，不删除。"""
+    h = harness(**deleting())
+    names = ['S/tvshow.nfo'] + ['S/S01/e%02d.nfo' % i for i in range(10)]
+    for name in names:
+        h.write(name, b'meta')
+    h.settle()
+    h.run()
+    h.repo.refresh_devices('tv', [(name, 999) for name in names])  # S 是另一块盘（子挂载）
+    shutil.rmtree(h.a / 'S')  # 掉盘：只剩空挂载点
+    h.write('S/tvshow.nfo', b'rescraped')
+    h.settle(scans=2)
+    h.run()
+    assert all(h.asset(name) is not None for name in names)
+    assert (h.c / 'S' / 'S01' / 'e00.nfo').exists() and h.remote.copies('/media/tv/S/S01/e00.nfo')
+    assert h.asset('S/S01/e00.nfo')['a_dev'] == 999
+
+
+def test_unlistable_remounted_root_does_not_kill_the_scanner(harness, monkeypatch):
+    """重新挂载后根目录能 stat 但列不了目录：不接受新身份、保持暂停删除，也不抛出异常让扫描线程退出。"""
+    from app.plugins.localmirror115 import filesystem
+    h = harness(**deleting())
+    h.write('a.nfo', b'x')
+    h.settle()
+    _remount(h, monkeypatch)
+
+    def denied(path):
+        """列目录时权限不足。"""
+        raise PermissionError(13, 'denied')
+    monkeypatch.setattr(filesystem, '_is_empty', denied)
+    h.engine._detect_remounts()
+    assert h.engine.status['roots']['tv'] == 'awaiting_scan' and not h.engine.fs.healthy(h.a)
+
+
+def test_remount_while_stopped_is_checked_after_restart(harness, monkeypatch):
+    """插件停止期间根目录重新挂载过（身份与上次全量扫描记下的不同）：启动后同样要核对内容才恢复删除。"""
+    h = harness(**deleting())
+    h.write('a.nfo', b'x')
+    h.settle()
+    h.engine.status['roots']['tv'] = 'awaiting_scan'
+    _remount(h, monkeypatch)
+    h.engine._note_remounts_while_stopped()
+    assert 'tv' in h.engine.remounted
+    assert h.engine.status['root_detail']['tv'] == '本地目录重新挂载过，核对已知文件后恢复删除'
+
+
+def test_clock_jump_forward_restarts_the_delete_delay(harness):
+    """系统时间前跳：消失时间同样后移，配置的删除延迟从校时后重新起算，不会提前删除。"""
+    h = harness(delete_delay_hours=1, **deleting())
+    mono = Clock(0)
+    h.engine.monotonic = mono
+    h.engine.clock_mark = (h.clock(), mono())
+    h.write('S/keep.nfo', b'keep')
+    h.write('S/e1.nfo', b'meta')
+    h.settle()
+    h.run()
+    (h.a / 'S' / 'e1.nfo').unlink()
+    h.settle(scans=2)
+    since = h.asset('S/e1.nfo')['missing_since']
+    h.engine.clock_mark = (h.clock(), mono())
+    h.clock.advance(7200)  # 时间突然前跳 2 小时，单调时钟没动
+    h.engine._check_clock()
+    assert h.asset('S/e1.nfo')['missing_since'] == since + 7200
+    mono.advance(601)
+    h.clock.advance(601)
+    h.run()
+    assert (h.c / 'S' / 'e1.nfo').exists()  # 删除延迟还没到

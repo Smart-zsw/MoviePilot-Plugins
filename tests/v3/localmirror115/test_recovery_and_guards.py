@@ -352,8 +352,8 @@ def test_empty_placeholder_root_is_rebound_after_mount(harness, tmp_path):
     assert engine.status['roots']['mv'] == 'ready'
 
 
-def test_populated_root_identity_change_still_needs_reinit(harness):
-    """已有文件的根目录被替换后仍需重新初始化，标记为不安全。"""
+def test_root_replaced_with_mismatched_content_stays_unsafe(harness):
+    """已有文件的根目录被换成内容不符的目录：接受新身份但核对失败，标记为不安全、暂停删除。"""
     h = harness()
     h.write('S/e1.nfo', b'x')
     h.settle()

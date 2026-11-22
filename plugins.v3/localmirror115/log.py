@@ -89,7 +89,7 @@ NOTE_LABELS = {
     'output_parent_not_directory': 'STRM目录中的上级路径不是目录', 'output_not_regular_file': 'STRM目录中同名路径不是普通文件',
     'copy_verification_failed': '复制后校验不一致',
     # 本地目录与扫描
-    'source_root_unhealthy': '本地实体库不可用或已变化', 'root_awaiting_scan': '等待首次扫描完成',
+    'source_root_unhealthy': '本地实体库不可用或已变化', 'root_awaiting_scan': '等待扫描完成',
     'root_scan_incomplete_or_unsafe': '扫描异常，暂停删除', 'root_unavailable': '本地实体库不可用',
     'empty_tree_requires_manual_review': '本地目录树意外为空，需要人工确认', 'scan_file_limit_exceeded': '文件数超过上限',
     'scan_stopped': '扫描被中止', 'scan_enqueue_stopped': '扫描被中止',

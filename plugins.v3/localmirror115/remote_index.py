@@ -374,7 +374,6 @@ class RemoteIndex:
 
     def describe(self):
         """返回各映射快照的状态摘要，供页面展示。"""
-
         out = {}
         with self.lock:
             status = {k: dict(v) for k, v in self.status.items()}
