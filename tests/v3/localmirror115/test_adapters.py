@@ -111,3 +111,79 @@ def test_cached_directory_expires(monkeypatch):
     chain.calls.clear()
     host.list_dir('/m/Show')
     assert chain.calls == ['get_file_item_strict', 'list_files']
+
+
+def test_concurrent_uploads_into_a_new_folder_create_it_once():
+    """两个上传同时要用同一个新目录：只建一次，第二个直接用第一个建好的（115 索引未生效时不会再建一个同名目录）。"""
+    import threading
+    import time
+
+    class SlowChain(Chain):
+        """get_folder 稍慢，且每次调用都会新建一个目录（模拟 115 索引尚未生效时的重复创建）。"""
+        def run_module_strict(self, method, **kwargs):
+            """get_folder 每次返回一个新 id，其余照旧。"""
+            if method == 'get_folder':
+                self.calls.append(method)
+                time.sleep(0.05)
+                self.next_id += 1
+                return SimpleNamespace(type='dir', fileid=str(self.next_id), path=str(kwargs['path']), name='')
+            return super().run_module_strict(method, **kwargs)
+        run_module = run_module_strict
+
+    chain = SlowChain()
+    host = remote(chain)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(host.ensure_dir('/m/New/Season 1').fileid))
+               for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert chain.calls.count('get_folder') == 1 and len(set(results)) == 1
+
+
+def test_network_errors_from_the_host_are_remote_failures():
+    """宿主调用中的网络中断、超时归为115请求失败（结果不明），并计入风控冷却的失败次数。"""
+    import pytest
+    from app.plugins.localmirror115.adapters import RateLimiter, RemoteUnknown
+
+    class BrokenChain(Chain):
+        """所有调用都因网络中断失败。"""
+        def run_module_strict(self, method, **kwargs):
+            """模拟连接被重置。"""
+            raise ConnectionError('reset by peer')
+        run_module = run_module_strict
+
+    host = Host115(BrokenChain(), SimpleNamespace, limiter=RateLimiter(qps=0, failure_threshold=3))
+    failures = []
+    host.limiter.failure = lambda: failures.append(1)
+    with pytest.raises(RemoteUnknown) as caught:
+        host.upload(SimpleNamespace(fileid='1'), '/tmp/x.nfo', 'x.nfo')
+    assert str(caught.value) == 'remote_call_failed' and isinstance(caught.value.__cause__, ConnectionError)
+    assert failures == [1]
+
+
+def test_new_folder_is_not_created_again_while_the_index_lags():
+    """刚建好的目录在115索引生效前按路径查不到、按 id 列出为空：仍按这个目录处理，下一个文件不会再建一个同名目录。"""
+    class LaggyChain(Chain):
+        """get_folder 每次都会新建目录；按路径查询一律查不到（索引未生效）；按 id 列出为空。"""
+        def run_module_strict(self, method, **kwargs):
+            """模拟115索引延迟。"""
+            self.calls.append(method)
+            if method == 'get_folder':
+                self.next_id += 1
+                return SimpleNamespace(type='dir', fileid=str(self.next_id), path=str(kwargs['path']), name='')
+            if method == 'get_file_item_strict':
+                return SimpleNamespace(item=None)
+            return []
+        run_module = run_module_strict
+
+    chain = LaggyChain()
+    host = remote(chain)
+    first = host.ensure_dir('/m/New Show/Season 1')
+    listing = host.list_dir('/m/New Show/Season 1')
+    assert listing is not None and listing['folder'].fileid == first.fileid and listing['entries'] == []
+    assert host.ensure_dir('/m/New Show/Season 1').fileid == first.fileid
+    assert chain.calls.count('get_folder') == 1
+    host.forget_folders('/m/New Show')
+    assert host.list_dir('/m/New Show/Season 1') is None  # 目录被删除后不再沿用

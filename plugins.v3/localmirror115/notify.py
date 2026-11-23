@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import threading
 import time
 
-from .log import duration_text, logger
+from .log import duration_text, fmt, logger
 
 QUIET_SECONDS = 30
 PROBE_INTERVAL = 5  # 检查到还有工作在进行后，隔几秒再检查本轮是否结束
@@ -15,7 +15,7 @@ FAILED_NAMES = 1000  # 失败明细最多保留的条数，其余只计数
 SECTIONS = (
     ('uploaded', '上传115'), ('reuploaded', '115缺失补传'), ('copied', '复制到STRM目录'),
     ('deleted_b', '删除115文件'), ('deleted_c', '删除STRM文件'),
-    ('adopted', '115已存在，无需上传'), ('adopted_c', 'STRM目录已存在，无需复制'),
+    ('adopted', '115已存在（无需上传）'), ('adopted_c', 'STRM目录已存在（无需复制）'),
 )
 
 
@@ -29,7 +29,7 @@ def new_state():
 
 
 class Notifier:
-    """汇总同步结果并发送批量通知与限流告警；发送失败不影响同步。"""
+    """汇总同步结果：每轮结束写一行汇总日志；开启通知时同时发送批量通知与限流告警，发送失败不影响同步。"""
 
     def __init__(self, send=None, enabled=False, clock=time.time, state=None):
         """绑定发送函数与共享状态，并登记为状态所有者。"""
@@ -78,8 +78,9 @@ class Notifier:
                 self.state['started_at'] = self.clock()
 
     def record(self, kind, name=None, reason=None, n=1):
-        """记录一项结果：失败项（kind='failed'）按名称保存原因，其他类别只累加计数（见 count）。"""
-        if not self.enabled or n <= 0:
+        """记录一项结果：失败项（kind='failed'）按名称保存原因，其他类别只累加计数（见 count）。
+        关闭通知时也照常计数，本轮结束时仍写汇总日志。"""
+        if n <= 0:
             return
         now = self.clock()
         with self.lock:
@@ -115,12 +116,10 @@ class Notifier:
         self.record(kind, n=n)
 
     def flush(self, force=False, probe=None):
-        """认领已结束的一轮并发送汇总；force 也不会跳过未完成的工作。
+        """认领已结束的一轮，写一行汇总日志，开启通知时同时发送汇总通知；force 也不会跳过未完成的工作。
 
         probe（可能读数据库）与发送都在锁外执行，慢渠道不会阻塞同步；probe 期间有新活动则本次作废。
         发送失败时把批次合并回状态并延后重试。"""
-        if not self.enabled:
-            return False
         with self.lock:
             s = self.state
             if (s['owner'] is not self.owner or s['sending'] or not any(s['counts'].values())
@@ -155,12 +154,22 @@ class Notifier:
             counts, items, first_at, last_at = s['counts'], s['items'], s['first_at'], s['last_at']
             s.update(counts={}, items={}, first_at=None, last_at=None, idle_since=None, started_at=None, sending=True,
                      failed_more=0)
-        sent = self._send(*self.compose(items, counts, elapsed=(last_at if last_at is not None else now)
-                                       - (first_at if first_at is not None else now),
-                                       deferred=status.get('deferred', 0)))
+        elapsed = (last_at if last_at is not None else now) - (first_at if first_at is not None else now)
+        deferred = status.get('deferred', 0)
+        # 汇总日志只写还没写过的部分：通知发送失败后计数会合并回来重试，不能把同一批数量再写一遍
+        logged = self.state.get('logged') or {}
+        fresh = {kind: n - logged.get(kind, 0) for kind, n in counts.items() if n > logged.get(kind, 0)}
+        if fresh:
+            failed = fresh.get('failed', 0)
+            logger.info(fmt('汇总', '本轮需关注' if failed or deferred else '本轮完成',
+                            *('%s %s' % item for item in self.tally(fresh, elapsed, deferred)),
+                            '需处理 %d 项' % failed if failed else ''))
+        # 关闭通知时只写汇总日志，本轮照常结束
+        sent = self._send(*self.compose(items, counts, elapsed=elapsed, deferred=deferred)) if self.enabled else True
         with self.lock:
             s = self.state
             s['sending'] = False
+            s['logged'] = {} if sent else dict(counts)  # 重试时只把之后新增的写进汇总日志
             if not sent:
                 # 发送期间可能有新结果到达：只能合并，绝不覆盖。
                 for kind, n in counts.items():
@@ -212,23 +221,28 @@ class Notifier:
         return self.alert(kind, '⚠️ 本地115镜像｜' + status, '\n'.join(lines))
 
     @staticmethod
-    def compose(items, counts, elapsed=None, deferred=0):
-        """生成汇总通知的标题和正文；失败项最多列出 LIST_LIMIT 条。"""
-        failed = counts.get('failed', 0)
-        title = ('⚠️ 本地115镜像｜本轮需关注' if failed or deferred else '✅ 本地115镜像｜本轮完成')
-        lines = []
+    def tally(counts, elapsed=None, deferred=0):
+        """本轮各项数量与用时 [(项目, 数量文字)]，汇总通知正文与汇总日志共用。"""
+        out = []
         for kind, label in SECTIONS:
             n = counts.get(kind, 0)
             if n:
                 dirs = counts.get('deleted_dirs_b') if kind == 'deleted_b' else 0
-                suffix = '（%d 个目录）' % dirs if dirs else ''
-                lines.append('%s  %d 个%s' % (label, n, suffix))
+                out.append((label, '%d 个%s' % (n, '（%d 个目录）' % dirs if dirs else '')))
         if counts.get('deleted_dirs_b') and not counts.get('deleted_b'):
-            lines.append('删除115目录  %d 个' % counts['deleted_dirs_b'])
+            out.append(('删除115目录', '%d 个' % counts['deleted_dirs_b']))
         if elapsed is not None:
-            lines.append('处理用时  ' + duration_text(elapsed))
+            out.append(('处理用时', duration_text(elapsed)))
         if deferred:
-            lines.append('暂缓处理  %d 项（受开关、冲突或删除延迟限制）' % deferred)
+            out.append(('暂缓处理', '%d 项（受开关、冲突或删除延迟限制）' % deferred))
+        return out
+
+    @staticmethod
+    def compose(items, counts, elapsed=None, deferred=0):
+        """生成汇总通知的标题和正文；失败项最多列出 LIST_LIMIT 条。"""
+        failed = counts.get('failed', 0)
+        title = ('⚠️ 本地115镜像｜本轮需关注' if failed or deferred else '✅ 本地115镜像｜本轮完成')
+        lines = ['%s  %s' % item for item in Notifier.tally(counts, elapsed, deferred)]
         if failed:
             lines.append('\n需处理  %d 项' % failed)
             failures = items.get('failed', {})

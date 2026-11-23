@@ -180,8 +180,8 @@ def test_page_buttons_return_the_standard_response(harness):
 
 
 def test_consecutive_new_files_in_one_folder_reuse_the_confirmation_listing(harness):
-    """同一目录连续上传两个新文件：第二个直接复用第一个上传后确认用的列表，少一次列目录。"""
-    h = harness()
+    """同一目录连续上传两个新文件（逐个上传时）：第二个直接复用第一个上传后确认用的列表，少一次列目录。"""
+    h = harness(upload_workers=1)
     h.write('S/keep.nfo', b'k')
     h.settle()
     h.run()

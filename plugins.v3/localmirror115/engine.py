@@ -22,8 +22,8 @@ from .directory_delete import process_deleted_directories
 from .notify import Notifier, new_state
 from .filesystem import ReadOnlyFilesystem, LocalOutput, Observation, OutputError, is_network_fs, mount_types
 from .persistence import FINAL, b_unseen, owned_ids, stable, tree_adopted
-from .log import (logger, where, size_text, note_label, error_detail, duration_text, MODE_LABEL, TARGET_LABEL,
-                  TARGET_PLACE)
+from .log import (logger, fmt, where, size_text, note_label, error_detail, duration_text, took_text, mappings_text,
+                  MODE_LABEL, TARGET_LABEL, TARGET_PLACE)
 
 
 def _runtime():
@@ -75,7 +75,8 @@ RATE_WINDOW = 120  # 估算实时速度/剩余时间所用的已完成工作时�
 MAX_UNCONFIRMED_UPLOADS = 3
 NO_OP_PLANS = ('would_adopt_existing', 'would_adopt_identical', 'would_reconfirm_existing')  # 计划中目标已有相同文件
 AUDIT_SUSPECT = 500     # 快照核对中已同步却不在快照里的文件超过此数，视快照可疑，不据此重传
-BIG_UPLOAD = 4 << 30     # 不小于此大小（4 GB）的文件开始上传时也记一笔
+BIG_UPLOAD = 1 << 30     # 不小于此大小（1 GB）的文件开始上传时也记一笔，便于看出哪些大文件正在上传
+BIG_BATCH = 20           # 一次稳定这么多文件（大批入库）时记一笔“发现”；零散的新增由每个文件的结果体现
 NETWORK_SETTLE = 60      # 网络盘的最短稳定观察秒数：属性有缓存，太短可能把写了一半的文件当成稳定
 CLOCK_JUMP = 300         # 系统时钟与单调时钟偏差超过此秒数视为时钟跳变
 CLOCK_HOLD = 600         # 时钟跳变后暂停删除的秒数
@@ -126,6 +127,9 @@ class SyncEngine:
         self.subtrees = set()   # 等待局部扫描的（映射 key，相对目录）
         self.threads = []
         self.listings = {}
+        self.listing_writes = {}  # 115目录 -> (插件写入次数, 最后写入时间)：列目录期间这个目录被写过时，结果不进缓存
+        self.busy = {'b': [], 'c': []}  # 正在处理的文件（并发上传时不止一个）
+        self.unchanged_lock = threading.Lock()
         self.listing_cleanup_at = 0.0
         self.scan_retry = {}    # 映射 key -> 全量扫描未完成后自动重扫的时间
         self.device_warned = {}  # 映射 key -> 上次提醒的“所在磁盘似乎掉线”的文件数
@@ -146,7 +150,6 @@ class SyncEngine:
                            'upload_enabled', 'copy_enabled', 'delete_enabled', 'scan_enabled')}}
         self.mapping_by_id = {m.key: m for m in config.mappings}
         self.done_times = {'b': collections.deque(maxlen=2000), 'c': collections.deque(maxlen=2000)}
-        self.passes = {'b': [0, None], 'c': [0, None]}  # 已处理文件数 / 本轮开始时间
         limits = (config.api_qps, config.failure_threshold, config.cooldown_base_seconds,
                   config.cooldown_max_seconds, self._cooldown)
         if self.runtime.limiter is None:
@@ -175,11 +178,12 @@ class SyncEngine:
                 self.status['roots'][m.key] = 'awaiting_scan'
             except OSError as error:
                 self._root(m.key, 'unavailable', str(error)[:200])
-                logger.warning('【启动】[%s] 本地目录不可用，挂载后会自动接上：%s（%s）', m.key, m.source, error)
+                logger.warning(fmt('启动', '[%s] 本地目录不可用' % m.key, error,
+                                   '挂载后会自动接上', subject=m.source))
 
     def _cooldown(self, wait):
         """115 进入风控冷却时记录日志并发出冷却提醒。"""
-        logger.warning('【风控】115连续请求失败，可能触发了风控，暂停访问 %d 秒后自动恢复', wait)
+        logger.warning(fmt('风控', '115连续请求失败，可能触发了风控', '暂停访问 %s后自动恢复' % duration_text(wait)))
         self.notifier.warning('cooldown', '115访问冷却',
                               '115同步暂停，元数据复制不受影响', '%s后自动重试' % duration_text(wait))
 
@@ -190,7 +194,7 @@ class SyncEngine:
         except OSError as error:
             self._root(mapping.key, 'unavailable', str(error)[:200])
             return False
-        logger.info('【启动】[%s] 本地目录已可用：%s', mapping.key, mapping.source)
+        logger.info(fmt('启动', '[%s] 本地目录已可用' % mapping.key, subject=mapping.source))
         self._root(mapping.key, 'awaiting_scan')
         self._start_watcher(mapping)
         return True
@@ -266,8 +270,8 @@ class SyncEngine:
     @_activity
     def request_scan(self, keys=None, reason=''):
         """安排一次全量扫描（可限定映射），并与已待执行的扫描范围合并。"""
-        logger.info('【扫描】安排全量扫描%s%s', '（映射：%s）' % '、'.join(sorted(keys)) if keys else '',
-                    '：' + reason if reason else '')
+        logger.info(fmt('扫描', '安排全量扫描',
+                        reason, subject=mappings_text(keys) if keys else '全部映射'))
         self.notifier.touch()
         with self.subtree_lock:
             if keys is None or (self.full_scan and self.scan_keys is None):
@@ -395,12 +399,14 @@ class SyncEngine:
                      if not self.config.excluded(k)}
             self._warn_unreadable(mapping, unreadable)
             queued, _ = self._enqueue_diff(mapping, manifest, known, 'directory', unreadable)
-            logger.info('【扫描】目录有变化，已重新扫描：%s（现有 %d 个文件，其中 %d 个有变化）',
-                        where(mapping.key, relative), len(manifest), queued)
+            if queued:  # 没有变化（如刚建好的空目录）不记日志，免得刷屏
+                logger.info(fmt('扫描', '已重新扫描变化的目录',
+                                '现有 %d 个文件' % len(manifest), '有变化 %d 个' % queued,
+                                subject=where(mapping.key, relative)))
         except InterruptedError:
             pass
         except OSError as error:
-            logger.warning('【扫描】目录扫描失败：%s %s（%s），改为全量扫描', mapping.key, relative, error)
+            logger.warning(fmt('扫描', '目录扫描失败，改为全量扫描', error, subject=where(mapping.key, relative)))
             self.request_scan(reason='目录扫描失败')  # 根目录本身存疑：退回全量扫描
         finally:
             with self.status_lock:
@@ -466,7 +472,8 @@ class SyncEngine:
             for old, new in moved.items():
                 if len(new) == 1 and old not in new and present[old] * 2 >= recorded[old]:
                     new = next(iter(new))
-                    logger.info('【扫描】[%s] 本地磁盘的设备号已从 %s 变为 %s（重新挂载），已更新记录', mapping.key, old, new)
+                    logger.info(fmt('扫描', '[%s] 本地磁盘重新挂载过，已更新记录' % mapping.key,
+                                    '设备号 %s → %s' % (old, new)))
                     self.repository.renumber_device(mapping.key, old, new)
             if devices:
                 self.repository.refresh_devices(mapping.key, devices)
@@ -475,8 +482,9 @@ class SyncEngine:
     def _warn_unreadable(self, mapping, unreadable):
         """有读不了的子目录时提醒：其中的文件既不同步也不删除。"""
         if unreadable:
-            logger.warning('【扫描】[%s] %d 个目录无法读取（权限不足或已断开），其中的文件暂不同步也不删除：%s%s',
-                           mapping.key, len(unreadable), '、'.join(unreadable[:3]), ' 等' if len(unreadable) > 3 else '')
+            logger.warning(fmt('扫描', '[%s] 有目录无法读取，其中的文件暂不同步也不删除' % mapping.key,
+                               '%d 个目录（权限不足或已断开）' % len(unreadable),
+                               '、'.join(unreadable[:3]) + (' 等' if len(unreadable) > 3 else '')))
 
     def _check_remount(self, mapping, manifest, known):
         """根目录重新挂载后的第一次扫描：已知文件至少一半仍在且大小一致，才确认还是原来的媒体库；否则抛出 OSError。"""
@@ -524,7 +532,7 @@ class SyncEngine:
                 continue
             self._accept_remount(m)
             began = self.clock()
-            logger.info('【扫描】[%s] 开始全量扫描：%s（只读取文件属性）', m.key, m.source)
+            logger.info(fmt('扫描', '[%s] 开始全量扫描' % m.key, '只读取文件属性', subject=m.source))
             try:
                 # 先读已知记录：遍历期间新增并已稳定的文件不在清单里，不能被误算为“消失”。
                 known = self.repository.fingerprints(m.key)
@@ -538,7 +546,8 @@ class SyncEngine:
                 files += len(manifest)
                 excluded = {k for k in known if self.config.excluded(k)}
                 if excluded:
-                    logger.info('【扫描】[%s] 有 %d 个文件命中新的排除规则，停止跟踪（不会删除）', m.key, len(excluded))
+                    logger.info(fmt('扫描', '[%s] 停止跟踪命中新排除规则的文件' % m.key,
+                                    '不会删除', subject='%d 个文件' % len(excluded)))
                     self.repository.forget(m.key, excluded)
                     known = {k: v for k, v in known.items() if k not in excluded}
                 # 意外为空的目录树绝不能作为删除基准。
@@ -554,22 +563,23 @@ class SyncEngine:
                 self._root(m.key, 'ready')
                 self._note_scanned(m)
                 self.scan_retry.pop(m.key, None)
-                logger.info('【扫描】[%s] 全量扫描完成：%d 个文件，发现变化 %d 个，消失 %d 个，用时 %.1f 秒%s',
-                            m.key, len(manifest), queued, gone, self.clock() - began,
-                            '；%d 个文件名无法编码已跳过' % skipped if skipped else '')
+                logger.info(fmt('扫描', '[%s] 全量扫描完成' % m.key, '%d 个文件' % len(manifest),
+                                '有变化 %d 个' % queued, '消失 %d 个' % gone,
+                                took_text(self.clock() - began),
+                                '%d 个文件名无法编码，已跳过' % skipped if skipped else ''))
             except InterruptedError:
-                logger.info('【扫描】[%s] 全量扫描被中止（插件停止或重启）', m.key)
+                logger.info(fmt('扫描', '[%s] 全量扫描被中止' % m.key, '插件停止或重启'))
                 self._root(m.key, 'scan_incomplete_or_unsafe', 'scan_stopped')
                 self._forget_scan(m.key)
             except OSError as error:
-                logger.warning('【扫描】[%s] 全量扫描未完成，暂停该映射的同步删除，%s后自动重新扫描：%s', m.key,
-                               duration_text(SCAN_RETRY), note_label(str(error)))
+                logger.warning(fmt('扫描', '[%s] 全量扫描未完成，暂停该映射的同步删除' % m.key,
+                                   note_label(str(error)), '%s后自动重新扫描' % duration_text(SCAN_RETRY)))
                 self._root(m.key, 'scan_incomplete_or_unsafe', str(error)[:200])
                 self._forget_scan(m.key)
                 self.scan_retry[m.key] = self.clock() + SCAN_RETRY
             except Exception as error:
-                logger.error('【扫描】[%s] 全量扫描出错，%s后自动重新扫描：%s', m.key, duration_text(SCAN_RETRY), error,
-                             exc_info=True)
+                logger.error(fmt('扫描', '[%s] 全量扫描出错' % m.key, error,
+                                 '%s后自动重新扫描' % duration_text(SCAN_RETRY)), exc_info=True)
                 self._root(m.key, 'scan_incomplete_or_unsafe', type(error).__name__)
                 self._forget_scan(m.key)
                 self.scan_retry[m.key] = self.clock() + SCAN_RETRY
@@ -631,8 +641,8 @@ class SyncEngine:
                                                                              for task in postponed]))
         for key, count in held.items():
             if self.device_warned.get(key) != count:  # 数量变化时才提醒，避免每分钟重复
-                logger.warning('【删除保护】[%s] %d 个消失的文件所在的盘似乎已断开（同一块盘上的其他文件也都找不到了），'
-                               '暂不删除，每分钟复查；恢复后会按实际情况处理', key, count)
+                logger.warning(fmt('删除保护', '[%s] 消失文件所在的盘似乎已断开，暂不删除' % key,
+                                   '同一块盘上的其他文件也都找不到了', '约每分钟复查，恢复后按实际情况处理', subject='%d 个文件' % count))
         self.device_warned = dict(held)
         if rechecks:
             self.repository.enqueue_many(rechecks)
@@ -641,15 +651,27 @@ class SyncEngine:
         for item in ready:
             by_mapping.setdefault(item[0]['mapping'], []).append(item)
         for key, items in by_mapping.items():
-            vanished = sum(1 for _, _, observation in items if observation['status'] == 'missing_candidate')
-            if vanished:
+            # 有已跟踪的文件消失时先开始“本地正在连续删除”的计时：分批写入期间，115线程可能已取走前一批记为消失的文件
+            previous = self.last_absence.get(key)
+            if any(observation['status'] == 'missing_candidate' and (key, task['relative']) in devices
+                   for task, _, observation in items):
                 self.last_absence[key] = self.clock()
-            count = sum(self.repository.settle_many(items[start:start + BATCH], self.clock())
-                        for start in range(0, len(items), BATCH))
-            if count:
-                logger.info('【发现】[%s] %d 个文件有变化并已稳定，开始处理（新增或修改 %d 个，消失 %d 个）',
-                            key, len(items), len(items) - vanished, vanished)
-            settled += count
+            counts = collections.Counter()
+            for start in range(0, len(items), BATCH):
+                counts += self.repository.settle_many(items[start:start + BATCH], self.clock())
+            # 只把真正的变化写进日志、算作“消失”：文件属性被碰了一下（改权限、媒体服务器刷新等）但大小和修改时间没变、
+            # 早已记为消失的再次确认、从未跟踪过的临时文件消失，都没有要做的事；它们也不刷新“本地正在连续删除”的计时
+            if not counts['removed']:
+                if previous is None:
+                    self.last_absence.pop(key, None)
+                else:
+                    self.last_absence[key] = previous
+            changed = counts['new'] + counts['modified']
+            if counts['removed'] or changed >= BIG_BATCH:  # 有文件消失（将要删除）或大批入库时才记
+                logger.info(fmt('发现', '[%s] %d 个文件有变化并已稳定，开始处理' % (key, changed + counts['removed']),
+                                *('%s %d 个' % (label, counts[kind]) for kind, label in
+                                (('new', '新增'), ('modified', '修改'), ('removed', '消失')) if counts[kind])))
+            settled += counts['settled']
         if settled:
             self.b_wake.set()
             self.c_wake.set()
@@ -726,8 +748,8 @@ class SyncEngine:
         jump = wall - (last_wall + (mono - last_mono))
         if abs(jump) <= CLOCK_JUMP:
             return
-        logger.warning('【时钟】系统时间%s了 %s，已调整待处理任务的时间，%s内暂停同步删除', '回退' if jump < 0 else '前跳',
-                       duration_text(abs(jump)), duration_text(CLOCK_HOLD))
+        logger.warning(fmt('时钟', '系统时间%s了 %s' % ('回退' if jump < 0 else '前跳', duration_text(abs(jump))),
+                           '已调整待处理任务的时间', '%s内暂停同步删除' % duration_text(CLOCK_HOLD)))
         self.repository.shift_schedule(jump, wall)
         if jump < 0:
             self.scan_retry = {key: due + jump for key, due in self.scan_retry.items()}
@@ -738,12 +760,11 @@ class SyncEngine:
         """记录一次处理失败并按退避安排重试；首次失败或冲突时发出通知。detail 为异常详情，只写日志。"""
         attempts = asset[target + '_attempts'] + 1
         label, text = TARGET_LABEL[target], note_label(note)
-        reason = text + ('，详情：%s' % detail if detail else '')
         if state == 'conflict':
-            logger.error('【%s】需要人工处理：%s（%s）', label, where(asset), reason)
+            logger.error(fmt(label, '需要人工处理', text, detail, subject=where(asset)))
         else:
-            logger.warning('【%s】处理失败：%s（%s；第 %d 次失败，%s 后自动重试）', label, where(asset), reason,
-                           attempts, duration_text(backoff(attempts)))
+            logger.warning(fmt(label, '处理失败', text, detail, '第 %d 次失败' % attempts,
+                               '%s后自动重试' % duration_text(backoff(attempts)), subject=where(asset)))
         fields = {target + '_note': note, target + '_attempts': attempts,
                   target + '_next': self.clock() + backoff(attempts), 'updated_at': self.clock()}
         if not (target == 'b' and asset.get('b_pending')):
@@ -794,19 +815,22 @@ class SyncEngine:
         label = TARGET_LABEL[target]
         if asset.get(target + '_note') != note or asset.get(target + '_state') != state:
             if state == 'planned':
-                logger.info('【%s】%s，未执行：%s（%s）', label, '试运行' if not self.config.writes else '对应开关未开启',
-                            where(asset), note_label(note))
+                logger.info(fmt(label, '试运行，未执行' if not self.config.writes else '开关未开启，未执行', note_label(note),
+                                subject=where(asset)))
             else:
-                logger.info('【%s】暂不删除：%s（%s）', label, where(asset), note_label(note))
+                logger.info(fmt(label, '暂不删除', note_label(note), subject=where(asset)))
 
     def _tally(self, target, asset, what):
         """无需实际操作的结果（如目标上已有相同文件）只计数，本批结束时按映射汇总成一条日志。"""
-        self.unchanged[(target, asset['mapping'], what)] += 1
+        with self.unchanged_lock:
+            self.unchanged[(target, asset['mapping'], what)] += 1
 
     def _flush_unchanged(self, target):
         """写出本批无需实际操作的汇总日志。"""
-        for key in sorted(k for k in self.unchanged if k[0] == target):
-            logger.info('【%s】[%s] %d 个文件%s', TARGET_LABEL[target], key[1], self.unchanged.pop(key), key[2])
+        with self.unchanged_lock:
+            done = [(key, self.unchanged.pop(key)) for key in sorted(k for k in self.unchanged if k[0] == target)]
+        for key, count in done:
+            logger.info(fmt(TARGET_LABEL[target], '[%s] 无需处理' % key[1], key[2], subject='%d 个文件' % count))
 
     def _finish_missing(self, asset):
         """清理已处理完的缺失条目。"""
@@ -817,7 +841,6 @@ class SyncEngine:
     def run_c(self):
         """C 工作线程的一轮：复制或删除一批到期的非视频文件；取满一批时返回 True。"""
         with self.runtime.c_lock:
-            began = self.clock()
             assets = self.repository.work('c', self.clock(), WORK_BATCH)
             if assets:
                 self.notifier.touch()
@@ -829,7 +852,6 @@ class SyncEngine:
                     with self._working('c', asset['relative']):
                         self._guard('c', asset, self._c_one, mapping, asset)
             self._flush_unchanged('c')
-            self._pass_done('c', len(assets), began, full=len(assets) >= WORK_BATCH)
             return len(assets) >= WORK_BATCH
 
     def _c_plan_batch(self, assets):
@@ -871,8 +893,8 @@ class SyncEngine:
             if note not in NO_OP_PLANS:
                 self._log_later(target, asset, 'planned', note)
             elif asset.get(target + '_note') != note or asset.get(target + '_state') != 'planned':
-                self._tally(target, asset, '%s：目标上已有相同文件，无需处理' % (
-                    '试运行' if not self.config.writes else '对应开关未开启'))
+                self._tally(target, asset, '%s，目标上已有相同文件' % (
+                    '试运行' if not self.config.writes else '开关未开启'))
         self.repository.record_many(target, [(asset, self._later_fields(target, 'planned', note))
                                              for asset, note in decided])
 
@@ -890,7 +912,7 @@ class SyncEngine:
                 if not self.config.writes:
                     return self._later('c', asset, 'planned', 'would_adopt_identical')
                 owner = asset['c_owner'] if not first else 'adopted'
-                self._tally('c', asset, '已有相同文件，记为已同步')
+                self._tally('c', asset, 'STRM目录已有相同文件，记为已同步')
                 self.notifier.count('adopted_c')
                 self.repository.record('c', asset, c_fp=asset['a_fp'], c_written=out.identity(relative, digest),
                     c_owner=owner or 'adopted', c_state='synced', c_note='adopted_identical' if first else 'identical',
@@ -909,7 +931,7 @@ class SyncEngine:
                 return self._defer('c', asset)
             if self.repository.record('c', asset, c_fp=asset['a_fp'], c_written=written, c_owner='written',
                                       c_state='synced', c_note='copied', c_attempts=0, updated_at=self.clock()):
-                logger.info('【STRM】已复制：%s（%s）', where(asset), size_text(asset['a_fp'].get('size')))
+                logger.info(fmt('STRM', '已复制', size_text(asset['a_fp'].get('size')), subject=where(asset)))
                 self.notifier.count('copied')
             return
         # A 已消失
@@ -924,10 +946,10 @@ class SyncEngine:
         result = out.remove(relative, asset['c_written'])
         state = 'kept' if result == 'changed_by_others_kept' else 'deleted'
         if result == 'deleted':
-            logger.info('【STRM】已删除：%s', where(asset))
+            logger.info(fmt('STRM', '已删除', subject=where(asset)))
             self.notifier.count('deleted_c')
         elif result == 'changed_by_others_kept':
-            logger.info('【STRM】写入后被他人修改过，保留不删：%s', where(asset))
+            logger.info(fmt('STRM', '保留不删', '写入后被他人修改过', subject=where(asset)))
         self.repository.record('c', asset, c_state=state, c_note=result, c_fp=None, c_written=None,
             c_owner=None, updated_at=self.clock())
         self._finish_missing(asset)
@@ -940,23 +962,31 @@ class SyncEngine:
             for key, (created, _) in list(self.listings.items()):
                 if now - created >= LISTING_TTL:
                     self.listings.pop(key, None)
+            for key, (_, written) in list(self.listing_writes.items()):
+                if now - written >= LISTING_TTL:  # 太久之前的写入已不可能落在正在进行的列目录期间
+                    self.listing_writes.pop(key, None)
             self.listing_cleanup_at = now + LISTING_TTL
         key = str(remote_dir)
         cached = self.listings.get(key)
         if cached and now - cached[0] < max_age:
             return cached[1]
+        writes = self.listing_writes.get(key, (0,))[0]
         listing = self.remote.list_dir(remote_dir)
-        self.listings[key] = (self.clock(), listing)
+        if writes == self.listing_writes.get(key, (0,))[0]:  # 列的同时另一个上传写了这个目录：这份列表可能已过时，只用这一次
+            self.listings[key] = (self.clock(), listing)
         return listing
 
     def _forget_listing(self, remote_dir, subtree=False):
         """插件写过这个 115 目录后丢弃它的列表缓存；subtree=True 时连同它的父目录和所有子目录一起丢弃。"""
         key = str(remote_dir)
-        self.listings.pop(key, None)
+        stale = [key]
         if subtree:
-            self.listings.pop(str(PurePosixPath(key).parent), None)
-            for other in [other for other in self.listings if other.startswith(key + '/')]:
-                self.listings.pop(other, None)
+            stale.append(str(PurePosixPath(key).parent))
+            # 先取快照再遍历：其他上传线程可能同时往缓存里加目录
+            stale += [other for other in list(self.listings) if other.startswith(key + '/')]
+        for other in stale:
+            self.listing_writes[other] = (self.listing_writes.get(other, (0,))[0] + 1, self.clock())
+            self.listings.pop(other, None)
 
     @staticmethod
     def _copies(listing, name):
@@ -979,7 +1009,6 @@ class SyncEngine:
         if self.remote is None:
             return
         with self.runtime.b_lock:
-            began = self.clock()
             assets = self.repository.work('b', self.clock(), WORK_BATCH)
             if assets:
                 self.notifier.touch()
@@ -987,19 +1016,50 @@ class SyncEngine:
             try:
                 rest = self._b_plan_batch(process_deleted_directories(self, ready))
                 self._delete_files([asset for asset in rest if asset['a_state'] == 'missing'])
-                for asset in rest:
-                    if self.stop_event.is_set():
-                        break
-                    mapping = self.mapping_by_id.get(asset['mapping'])
-                    if mapping is None or asset['a_state'] == 'missing':
-                        continue
-                    with self._working('b', asset['relative']):
-                        self._guard('b', asset, self._b_one, mapping, asset)
+                self._b_concurrently([asset for asset in rest if asset['a_state'] != 'missing'
+                                      and asset['mapping'] in self.mapping_by_id])
             except Stopped:
                 pass  # 正在停止：剩余条目留到下次启动，不算失败
             self._flush_unchanged('b')
-            self._pass_done('b', len(ready), began, full=len(assets) >= WORK_BATCH)
             return len(assets) >= WORK_BATCH
+
+    def _b_task(self, asset):
+        """处理一个 A 存在的 115 条目（上传、认领或确认），并在状态页标记为正在处理。"""
+        with self._working('b', asset['relative']):
+            self._guard('b', asset, self._b_one, self.mapping_by_id[asset['mapping']], asset)
+
+    def _b_concurrently(self, assets):
+        """用 upload_workers 个线程同时处理这一批 115 条目（所有文件一视同仁，谁先空闲谁取下一个），
+        全部完成后返回；插件停止时抛出 Stopped。所有线程共用同一个限速器与风控冷却，并发不增加每秒的115请求数。"""
+        todo, errors = collections.deque(assets), []
+
+        def run():
+            """不断取下一个条目处理；插件停止或出错时清空队列，其他线程随之不再取新条目。"""
+            while not self.stop_event.is_set():
+                try:
+                    asset = todo.popleft()
+                except IndexError:
+                    return
+                try:
+                    self._b_task(asset)
+                except BaseException as error:  # Stopped 或意外错误：交给本轮统一处理
+                    errors.append(error)
+                    todo.clear()
+
+        workers = min(self.config.upload_workers, len(assets))
+        if workers <= 1:
+            run()  # 只有一路时直接在当前线程逐个处理
+        else:
+            threads = [threading.Thread(target=run, daemon=True, name='localmirror115-upload') for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        unexpected = [error for error in errors if not isinstance(error, Stopped)]
+        if unexpected:
+            raise unexpected[0]
+        if errors or self.stop_event.is_set():
+            raise Stopped('stopped')
 
     def _await_quiet(self, assets):
         """本地还在连续删除时先不删115：映射最近 DELETE_QUIET 秒内仍有文件消失，就把消失的文件推迟到删除停下后。
@@ -1015,8 +1075,8 @@ class SyncEngine:
                 waiting.append((asset, {'b_next': min(last + DELETE_QUIET, cap)}))
         quiet = {asset['mapping'] for asset, _ in waiting}
         for key in quiet - self.quieting:
-            logger.info('【115】[%s] 本地正在连续删除文件，等删除停下 %d 秒后再合并删除115上的对应文件',
-                        key, DELETE_QUIET)
+            logger.info(fmt('115', '[%s] 等本地删除停下' % key,
+                            '停下 %d 秒后合并删除115上的对应文件' % DELETE_QUIET))
         self.quieting = (self.quieting | quiet) - {asset['mapping'] for asset in assets
                                                    if asset['a_state'] == 'missing' and asset['mapping'] not in quiet}
         if not waiting:
@@ -1037,7 +1097,10 @@ class SyncEngine:
                 raise Stopped('stopped') from error
             self._error(target, asset, str(error), detail=error_detail(error.__cause__))
         except OSError as error:
-            self._error(target, asset, 'local_io_failed', detail=error_detail(error))
+            # 网络中断、超时也是 OSError 的子类：115 适配层已把它们归为115请求失败，这里兜住其他远端实现直接抛出的
+            remote = target == 'b' and isinstance(error, (ConnectionError, TimeoutError))
+            note = 'remote_call_failed' if remote else 'local_io_failed'
+            self._error(target, asset, note, detail=error_detail(error))
         except Exception as error:
             if target != 'b':
                 raise
@@ -1052,24 +1115,15 @@ class SyncEngine:
     def _working(self, target, text, count=1):
         """在状态页标记正在处理的内容；结束后记下 count 个完成时间，用于估算剩余时间。"""
         with self.status_lock:
-            self.status[target + '_busy'] = text
+            self.busy[target].append(text)
+            self.status[target + '_busy'] = '、'.join(self.busy[target])
         try:
             yield
         finally:
             with self.status_lock:
-                self.status[target + '_busy'] = None
+                self.busy[target].remove(text)
+                self.status[target + '_busy'] = '、'.join(self.busy[target]) or None
             self.done_times[target].extend([self.clock()] * count)
-
-    def _pass_done(self, target, processed, began, full):
-        """累计本轮处理数，队列处理完（这一批没取满）才写一条汇总日志。"""
-        stats = self.passes[target]
-        if processed:
-            stats[0] += processed
-            stats[1] = stats[1] if stats[1] is not None else began
-        if stats[0] and not full:
-            logger.info('【%s】本批检查结束：%d 个文件，用时 %.1f 秒', TARGET_LABEL[target], stats[0],
-                        self.clock() - stats[1])
-            self.passes[target] = [0, None]
 
     def _synced_fields(self, asset, fileid, note):
         """生成把 B 标记为已同步时需写入的字段。"""
@@ -1081,10 +1135,9 @@ class SyncEngine:
         if self.repository.record('b', asset, **self._synced_fields(asset, fileid, note)):
             if note.startswith('verified'):
                 took = (asset.get('b_pending') or {}).get('took')
-                details = [size_text(asset['a_fp'].get('size'))] + (['用时 %.1f 秒' % took] if took is not None else [])
-                if note == 'verified_duplicates_removed':
-                    details.append('已清理重复副本')
-                logger.info('【115】已上传：%s（%s）', where(asset), '，'.join(details))
+                logger.info(fmt('115', '已上传', size_text(asset['a_fp'].get('size')),
+                                took_text(took) if took is not None else '',
+                                '已清理重复副本' if note == 'verified_duplicates_removed' else '', subject=where(asset)))
                 self.notifier.count('reuploaded' if asset.get('b_note') == 'missing_on_115' else 'uploaded')
             else:
                 self._tally('b', asset, '115上已有相同文件，记为已同步')
@@ -1112,7 +1165,7 @@ class SyncEngine:
                 size_ok, key=lambda c: (float(c['mtime'] or 0), str(c['fileid'])))
             extras = [c for c in copies if c['fileid'] != keep['fileid']]
             if extras:
-                logger.info('【115】发现 %d 个重复副本，保留一个、其余删除：%s', len(extras), where(asset))
+                logger.info(fmt('115', '清理重复副本', '%d 个重复，保留一个' % len(extras), subject=where(asset)))
                 if not (self.config.writes and self.config.upload_enabled):
                     self._later('b', asset, 'planned', 'would_remove_%d_duplicate_uploads' % len(extras))
                     return True
@@ -1131,20 +1184,20 @@ class SyncEngine:
             note = 'awaiting_remote_index' if not copies else 'awaiting_remote_index_%d_copies' % len(copies)
             wait = min(600.0, max(60.0, age / 2))  # 索引越久不出现，查得越稀
             if asset.get('b_note') != note:
-                logger.info('【115】已上传，等115索引出现后确认：%s', where(asset))
+                logger.info(fmt('115', '等115索引', '已上传，出现后确认', subject=where(asset)))
             self.repository.record('b', asset, b_state='verify', b_note=note,
                 b_next=self.clock() + wait, updated_at=self.clock())
             return True
         if pending.get('uploads', 1) >= MAX_UNCONFIRMED_UPLOADS:
-            logger.error('【115】需要人工处理：%s（已上传 %d 次仍未在115中出现，可能被115改名，停止重传）',
-                         where(asset), pending.get('uploads', 1))
+            logger.error(fmt('115', '需要人工处理',
+                             '已上传 %d 次仍未在115中出现，可能被115改名，停止重传' % pending.get('uploads', 1), subject=where(asset)))
             self.repository.record('b', asset, b_state='conflict',
                 b_note='upload_never_confirmed_after_%d_uploads' % pending.get('uploads', 1),
                 b_next=self.clock() + PLANNED_RECHECK, updated_at=self.clock())
             return True
         # 确认窗口已过：退回常规替换（删同名副本、重传、确认），而不是无限等待。
-        logger.warning('【115】上传后 %d 分钟仍未在115确认，将重新上传：%s', self.config.verify_window_minutes,
-                       where(asset))
+        logger.warning(fmt('115', '重新上传',
+                           '上传后 %g 分钟仍未在115确认' % self.config.verify_window_minutes, subject=where(asset)))
         return False
 
     def _snapshot_decision(self, asset, snap):
@@ -1233,7 +1286,7 @@ class SyncEngine:
             if not self.repository.record('b', asset, b_fp=None, b_fileid=None):
                 return  # 期间 A 已变化
             self._forget_remote(asset)
-            logger.info('【115】内容有变化，先删除115上的 %d 个旧副本（进入回收站）：%s', len(copies), where(asset))
+            logger.info(fmt('115', '删除旧副本', '内容有变化，先删 %d 个旧副本（进入回收站）' % len(copies), subject=where(asset)))
             if len(self._delete_copies(remote_dir, name, copies)) < len(copies):
                 raise RemoteUnknown('delete_old_copy_failed')
             listing = self._listing(remote_dir, max_age=0)
@@ -1245,8 +1298,8 @@ class SyncEngine:
         previous = pending if pending and pending['fp'] == asset['a_fp'] else None
         uploads = (previous.get('uploads', 1) if previous else 0) + 1
         if uploads > 1 or asset['a_fp'].get('size', 0) >= BIG_UPLOAD:  # 大文件和重传先记一笔，便于看进度
-            logger.info('【115】开始上传：%s（%s%s）', where(asset), size_text(asset['a_fp'].get('size')),
-                        '，第 %d 次上传' % uploads if uploads > 1 else '')
+            logger.info(fmt('115', '开始上传', size_text(asset['a_fp'].get('size')),
+                            '第 %d 次上传' % uploads if uploads > 1 else '', subject=where(asset)))
         began = self.clock()
         result = self.remote.upload(folder, mapping.source / str(relative), name)
         self._forget_listing(remote_dir)
@@ -1297,7 +1350,7 @@ class SyncEngine:
             except Exception as error:
                 if self.stop_event.is_set():
                     raise Stopped('stopped') from error
-                logger.warning('【115】批量删除请求出错，逐个目录重新确认结果（%s）', error_detail(error))
+                logger.warning(fmt('115', '批量删除请求出错，逐个目录重新确认结果', error_detail(error)))
                 deleted = set()
         relisted = {}
         for asset, plan in plans:
@@ -1329,7 +1382,7 @@ class SyncEngine:
             # 从目录树认领（不知道 id）：只有同名且同大小的才算我们的。
             targets += [c for c in copies if c['size'] == asset['b_fp']['size'] and c not in targets]
         if not targets:
-            logger.info('【115】115上已不存在，无需删除：%s', where(asset))
+            logger.info(fmt('115', '无需删除', '115上已不存在', subject=where(asset)))
             return 'already_gone'
         self._forget_remote(asset)
         return remote_dir, name, targets
@@ -1346,8 +1399,8 @@ class SyncEngine:
             if any(str(item['fileid']) in relisted[key] for item in failed):
                 raise RemoteUnknown('delete_failed')
         self._forget_listing(remote_dir)
-        logger.info('【115】已删除（进入回收站）：%s%s', where(asset),
-                    '（含 %d 个同名副本）' % len(targets) if len(targets) > 1 else '')
+        logger.info(fmt('115', '已删除', '进入回收站',
+                        '含 %d 个同名副本' % len(targets) if len(targets) > 1 else '', subject=where(asset)))
         self.notifier.count('deleted_b')
         return True
 
@@ -1396,22 +1449,21 @@ class SyncEngine:
         """生成一个映射的快照，唤醒依据旧快照做出的计划，并核对已同步的行。"""
         self.notifier.touch()
         mode = MODE_LABEL.get(self.index.effective_mode()[0], '')
-        logger.info('【快照】[%s] 开始生成115目录快照：%s（方式：%s，不下载文件）', m.key, m.remote, mode)
+        logger.info(fmt('快照', '[%s] 开始生成115目录快照' % m.key, '方式：%s' % mode, '不下载文件', subject=m.remote))
         began = self.clock()
         try:
             snap = self.index.build(m)
             self.listings.clear()  # 快照比任何缓存的目录列表都新
             woken = self.repository.wake_planned(m.key)  # 计划是依据上一份快照做出的
             if woken:
-                logger.info('【快照】[%s] 有 %d 个115计划按新快照重新比对', m.key, woken)
-            logger.info('【快照】[%s] 115目录快照完成：%d 条，方式：%s，用时 %.1f 秒%s', m.key, len(snap.entries),
-                        MODE_LABEL.get(snap.mode, snap.mode),
-                        self.clock() - began,
-                        '（目录树不可用，已改用逐个详细比对）' if snap.mode != snap.requested else '')
+                logger.info(fmt('快照', '[%s] 按新快照重新比对115计划' % m.key, subject='%d 个文件' % woken))
+            logger.info(fmt('快照', '[%s] 115目录快照完成' % m.key, '%d 条' % len(snap.entries),
+                            '方式：%s' % MODE_LABEL.get(snap.mode, snap.mode), took_text(self.clock() - began),
+                            '目录树不可用，已改用逐个详细比对' if snap.mode != snap.requested else ''))
         except Exception as error:
             if isinstance(error, Stopped) or self.stop_event.is_set():
                 return  # 插件正在停止，不算失败
-            logger.warning('【快照】[%s] 115目录快照生成失败：%s，稍后自动重试', m.key, describe(error))
+            logger.warning(fmt('快照', '[%s] 115目录快照生成失败' % m.key, describe(error), '稍后自动重试'))
             self.repository.wake_planned(m.key, waiting_only=True)  # 等快照的新文件改用实时列目录，不再干等
             count = self.index.failures.get(m.key, (0, 0))[0]
             if count >= 3:
@@ -1427,18 +1479,18 @@ class SyncEngine:
         synced = self.repository.synced_on_remote(mapping.key, before=snap.started_at)
         gone = [row_id for row_id, relative in synced if not snap.has(relative)]
         if len(gone) > AUDIT_SUSPECT:
-            logger.warning('【快照】[%s] 有 %d/%d 个已同步文件不在115快照里，数量过多，快照可能有误，忽略本次核对',
-                           mapping.key, len(gone), len(synced))
+            logger.warning(fmt('快照', '[%s] 快照可能有误，忽略本次核对' % mapping.key,
+                               '%d/%d 个已同步文件不在115快照里，数量过多' % (len(gone), len(synced))))
             result = {'state': 'suspect', 'missing': len(gone), 'synced': len(synced), 'at': self.clock()}
             self.notifier.warning('audit_' + mapping.key, '115快照核对暂缓',
                 '%s：%d/%d 个已同步文件未出现在快照中' % (mapping.key, len(gone), len(synced)),
                 '已忽略本次核对，避免错误重传；请检查115目录与授权')
         else:
             if gone:
-                logger.info('【快照】[%s] 有 %d 个已同步文件在115上已不存在，%s', mapping.key, len(gone),
-                            '已安排重新上传' if self.config.writes else '试运行不处理')
+                logger.info(fmt('快照', '[%s] 已同步的文件在115上已不存在' % mapping.key,
+                                '已安排重新上传' if self.config.writes else '试运行不处理', subject='%d 个文件' % len(gone)))
             elif synced:
-                logger.info('【快照】[%s] 核对 %d 个已同步文件，115上都在', mapping.key, len(synced))
+                logger.info(fmt('快照', '[%s] 核对完成，115上都在' % mapping.key, subject='%d 个已同步文件' % len(synced)))
             if gone and self.config.writes:
                 self.repository.mark_missing_on_remote(gone, self.clock())
             result = {'state': 'ok', 'missing': len(gone), 'synced': len(synced), 'at': self.clock(),
@@ -1576,7 +1628,8 @@ class SyncEngine:
         self.remounted.add(mapping.key)
         if not self.fs.rebind(mapping.source):
             return False  # 刚好又变了或不可访问：保持暂停删除，下次再接
-        logger.warning('【扫描】[%s] 本地目录重新挂载过（目录身份已变），重新扫描并核对已知文件后再恢复删除', mapping.key)
+        logger.warning(fmt('扫描', '[%s] 本地目录重新挂载过' % mapping.key,
+                           '重新扫描并核对已知文件后再恢复删除'))
         self._start_watcher(mapping)
         return True
 
@@ -1610,14 +1663,15 @@ class SyncEngine:
         from watchfiles import watch, Change
         polling = self.config.force_polling or is_network_fs(self.fstype.get(mapping.key))
         if polling and not self.config.force_polling:
-            logger.info('【监控】[%s] 本地目录在网络盘或远程挂载上（%s），自动使用兼容模式（轮询）',
-                        mapping.key, self.fstype.get(mapping.key))
+            logger.info(fmt('监控', '[%s] 本地目录在网络盘或远程挂载上，自动使用兼容模式（轮询）' % mapping.key,
+                            '挂载类型：%s' % self.fstype.get(mapping.key)))
         failures = 0  # 轮询也出错的连续次数，决定重试等待
         while not self.stop_event.is_set():
             with self.status_lock:
                 self.status['watchers'][mapping.key] = 'polling' if polling else 'native_requested'
-            logger.info('【监控】[%s] 开始实时监控：%s（%s）', mapping.key, mapping.source,
-                        '兼容模式，每 %g 秒轮询' % self.config.poll_seconds if polling else '性能模式，系统文件事件')
+            logger.info(fmt('监控', '[%s] 开始实时监控' % mapping.key,
+                            '兼容模式，每 %g 秒轮询' % self.config.poll_seconds if polling else '性能模式，系统文件事件',
+                            subject=mapping.source))
             try:
                 for changes in watch(mapping.source, stop_event=self.stop_event, recursive=True,
                                      watch_filter=None, force_polling=polling,
@@ -1629,8 +1683,8 @@ class SyncEngine:
                     try:
                         self.hint_many(paths, 'filesystem')
                     except Exception as error:  # 例如数据库短暂繁忙：继续监控并补扫这些变化所在的目录
-                        logger.warning('【监控】处理 %d 个变化失败，稍后补扫所在目录（%s）', len(paths),
-                                       type(error).__name__)
+                        logger.warning(fmt('监控', '处理文件变化失败，稍后补扫所在目录',
+                                           type(error).__name__, subject='%d 个变化' % len(paths)))
                         for parent in {Path(path).parent for path in paths}:
                             if parent != mapping.source and mapping.source in parent.parents:
                                 self.request_subtree(mapping, parent.relative_to(mapping.source).as_posix())
@@ -1643,18 +1697,18 @@ class SyncEngine:
                 text = str(error)
                 hint = ''
                 if 'inotify' in text.lower() or ('watch' in text.lower() and 'limit' in text.lower()):
-                    hint = '；目录太多超过了系统的 inotify 上限，可在宿主机执行 sysctl -w fs.inotify.max_user_watches=524288'
+                    hint = '目录太多超过了系统的 inotify 上限，可在宿主机执行 sysctl -w fs.inotify.max_user_watches=524288'
                 with self.status_lock:
                     self.status['watchers'][mapping.key] = 'failed_retrying'
                 if not polling:
                     polling = True
-                    logger.warning('【监控】[%s] 性能模式出错（%s）%s，改用兼容模式（轮询）继续监控', mapping.key,
-                                   error_detail(error), hint)
+                    logger.warning(fmt('监控', '[%s] 性能模式出错，改用兼容模式（轮询）继续监控' % mapping.key,
+                                       error_detail(error), hint))
                 else:
                     wait = min(backoff(failures), WATCH_RETRY_MAX)
                     failures += 1
-                    logger.warning('【监控】[%s] 实时监控出错（%s）%s，%s后重试', mapping.key, error_detail(error), hint,
-                                   duration_text(wait))
+                    logger.warning(fmt('监控', '[%s] 实时监控出错' % mapping.key, error_detail(error), hint,
+                                       '%s后重试' % duration_text(wait)))
                     if self.stop_event.wait(wait):
                         return
                 self.request_scan([mapping.key], reason='实时监控中断期间可能漏掉变化')
@@ -1680,8 +1734,8 @@ class SyncEngine:
         for key in resumed:
             self._root(key, 'ready')
         if resumed:
-            logger.info('【启动】插件只是短暂重启（%d 秒内）且目录和文件规则未变，沿用上次全量扫描结果，不重新扫描：%s',
-                        SHORT_RESTART, '、'.join(sorted(resumed)))
+            logger.info(fmt('启动', '短暂重启，沿用上次全量扫描结果',
+                            '%d 秒内重启且目录和文件规则未变，不重新扫描' % SHORT_RESTART, subject=mappings_text(resumed)))
             with self.status_lock:
                 self.status['resumed'] = sorted(resumed)
                 info = self.scan_record.get('last_scan_info')

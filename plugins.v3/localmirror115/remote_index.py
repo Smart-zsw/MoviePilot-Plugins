@@ -16,7 +16,7 @@ from itertools import islice
 from contextlib import contextmanager
 from pathlib import Path
 
-from .log import logger
+from .log import fmt, logger
 from .adapters import RemoteUnknown, Stopped, cleanup_export, describe, export_tree, tree_export_available
 
 SAVE_BATCH = 5000  # 每批编码并写入 gzip 的快照条目数
@@ -336,7 +336,7 @@ class RemoteIndex:
                         raise  # 115 正在限流：不紧接着发起大量逐目录请求，稍后整体重试
                     # Cookie 无效或导出繁忙不能卡住镜像：退回 detail 模式
                     reason = describe(error)
-                    logger.warning('【快照】[%s] 目录树导出失败（%s），本次改用逐个详细比对', mapping.key, reason)
+                    logger.warning(fmt('快照', '[%s] 目录树导出失败，本次改用逐个详细比对' % mapping.key, reason))
                     mode, note = 'detail', '目录树导出失败（%s），本次改用逐个详细比对' % reason
             if entries is None:
                 entries = {k: compact(v) for k, v in self.remote.walk(mapping.remote, self.stop).items()}

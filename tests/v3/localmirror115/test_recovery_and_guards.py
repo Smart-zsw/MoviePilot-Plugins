@@ -96,8 +96,10 @@ def test_file_renamed_during_upload_leaves_no_orphan(harness):
     original = h.remote.upload
 
     def upload_then_rename(folder, local, name):
-        """上传后重命名源文件并完成稳定。"""
+        """上传 old.mkv 后重命名源文件并完成稳定。"""
         result = original(folder, local, name)
+        if name != 'old.mkv':
+            return result
         os.rename(path, h.a / 'S' / 'new.mkv')
         h.engine.hint(str(path))       # 期间由稳定线程记录文件缺失
         h.clock.advance(2)

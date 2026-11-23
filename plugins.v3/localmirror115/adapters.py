@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from app.schemas.file import FileItem
 from app.sdk.chain import ChainBase
 
-from .log import error_detail, logger, note_label
+from .log import error_detail, fmt, logger, note_label
 
 FOLDER_TTL = 600  # 目录条目缓存的有效秒数，过期后按路径重新确认
 BATCH_DELETE = 1000  # 每次批量删除请求最多包含的文件和目录数
@@ -139,10 +139,15 @@ class Remote:
         self.stop = stop
         self.batch_delete = None  # 可选的批量删除通道（CookieDeleter）
         self.batch_failures = 0  # 批量删除连续失败次数
+        self.delete_lock = threading.Lock()  # 并发上传时删除旧副本也可能同时发生：合并删除流程逐个进行
 
     def delete_many(self, items):
-        """删除多个文件或目录 [(路径, fileid, 'file'|'dir')]，返回已删除的 fileid 集合。
-        有批量通道时每 BATCH_DELETE 个合并为一次请求；没有批量通道时逐个删除。
+        """删除多个文件或目录 [(路径, fileid, 'file'|'dir')]，返回已删除的 fileid 集合（并发上传时逐个进行）。"""
+        with self.delete_lock:
+            return self._delete_many(items)
+
+    def _delete_many(self, items):
+        """合并删除的具体流程：有批量通道时每 BATCH_DELETE 个合并为一次请求；没有批量通道时逐个删除。
         某批失败时只对其中前 FALLBACK_LIMIT 个逐个删除，其余结果不明，由调用方重新列目录确认后稍后重试，
         避免 115 限流时把一批拆成上千次请求。"""
         rest, done, requests, fallback = [item for item in items if item[1]], set(), 0, []
@@ -184,7 +189,8 @@ class Remote:
                     raise Stopped('stopped')
                 # 单个失败不影响其余条目；调用方会重新列目录确认这一个
         if len(items) > 1:
-            logger.info('【115】本轮删除 %d 项（文件或目录），成功 %d 项，共 %d 次115请求', len(items), len(done), requests)
+            logger.info(fmt('115', '批量删除', '成功 %d 项' % len(done),
+                            '共 %d 次115请求' % requests, subject='%d 项（文件或目录）' % len(items)))
         return done
 
 
@@ -199,6 +205,8 @@ class Host115(Remote):
         self.chain = chain
         self.FileItem = file_item_cls
         self.folders = {}  # 远端目录路径 -> (目录条目, 缓存时间)：列目录时省去一次查询
+        self.folder_lock = threading.Lock()  # 同一目录不能被两个上传同时创建（115 会出现同名目录）
+        self.created = {}  # 本插件最近建好的目录 -> (目录条目, 时间)：115 索引生效前按路径查不到，也不再重复创建
 
     def _call(self, strict, method, **kwargs):
         """经限速器调用宿主存储方法，并把结果反馈给限速器。"""
@@ -206,6 +214,10 @@ class Host115(Remote):
         try:
             runner = self.chain.run_module_strict if strict else self.chain.run_module
             result = runner(method, **kwargs)
+        except (ConnectionError, TimeoutError) as error:
+            # 网络中断、超时是115请求失败（不是本地读写失败）：在这里统一归类，所有调用方都按“结果不明”处理
+            self.limiter.failure()
+            raise RemoteUnknown('remote_call_failed') from error
         except Exception:
             self.limiter.failure()
             raise
@@ -261,6 +273,10 @@ class Host115(Remote):
             self.folders.pop(key, None)
         folder = self.folder(path)
         if folder is None:
+            recent = self.created.get(key)
+            if items is not None and recent is not None and time.monotonic() - recent[1] < FOLDER_TTL:
+                # 刚由本插件建好的目录：按 id 列得出、按路径却查不到，多半是115索引还没生效，按这个目录处理
+                return self._listed(key, recent[0], items)
             return None
         if items is not None and getattr(folder, 'fileid', None) == getattr(cached, 'fileid', None):
             return self._listed(key, folder, [])  # 缓存的确实是这个空目录：不必再列一次
@@ -291,9 +307,10 @@ class Host115(Remote):
     def forget_folders(self, path):
         """目录被删除后清除它及其子目录的缓存条目。"""
         prefix = str(path)
-        for key in list(self.folders):
-            if key == prefix or key.startswith(prefix + '/'):
-                self.folders.pop(key, None)
+        for cache in (self.folders, self.created):
+            for key in list(cache):
+                if key == prefix or key.startswith(prefix + '/'):
+                    cache.pop(key, None)
 
     def walk(self, root, stop=None):
         """详细模式遍历：以 {相对路径: 条目} 返回 root 下所有文件，并统计同名副本数。"""
@@ -328,12 +345,22 @@ class Host115(Remote):
                     raise
 
     def ensure_dir(self, path):
-        """获取或创建远端目录；结果没有 fileid 或不是目录时抛出 RemoteUnknown。"""
-        folder = self._call(False, 'get_folder', storage=self.storage, path=Path(str(path)))
-        if folder is None or not getattr(folder, 'fileid', None) or getattr(folder, 'type', None) != 'dir':
-            raise RemoteUnknown('folder_create_failed')
-        self._remember(str(path), folder)  # 之后列这个目录省去一次查询
-        return folder
+        """获取或创建远端目录；结果没有 fileid 或不是目录时抛出 RemoteUnknown。
+        逐个进行并先查缓存：并发上传到同一个新目录时，第二个直接用第一个刚建好的目录，
+        不会因 115 索引还没生效而再建一个同名目录。"""
+        key = str(path)
+        with self.folder_lock:
+            cached = self._cached_folder(key)
+            if cached is not None:
+                return cached
+            folder = self._call(False, 'get_folder', storage=self.storage, path=Path(key))
+            if folder is None or not getattr(folder, 'fileid', None) or getattr(folder, 'type', None) != 'dir':
+                raise RemoteUnknown('folder_create_failed')
+            self._remember(key, folder)  # 之后列这个目录省去一次查询
+            now = time.monotonic()
+            self.created = {other: hit for other, hit in self.created.items() if now - hit[1] < FOLDER_TTL}
+            self.created[key] = (folder, now)
+            return folder
 
     def upload(self, folder, local_path, name):
         """上传本地文件到远端目录，返回条目或 None；结果须经目录列表确认后才可信。"""

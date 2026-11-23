@@ -2,6 +2,7 @@
 
 表名带 schema 版本：变更列时新建表或提供 get_database_migrations() 迁移，create_all 不会修改已有表。
 """
+import collections
 import json
 import random
 import threading
@@ -252,7 +253,9 @@ class Repository:
                 observation=json.loads(r.observation), due=r.due, origin=r.origin) for r in rows]
 
     def settle_many(self, items, now):
-        """在一个事务中批量 settle [(task, kind, observation)]，返回成功数量。"""
+        """在一个事务中批量 settle [(task, kind, observation)]，返回 Counter：settled 为成功数量，
+        new / modified / removed 为其中真正新增、内容变化、这次才消失的已跟踪文件数（属性被碰了一下但大小和
+        修改时间没变、早已记为消失的再次确认、从未跟踪过的临时文件消失，都不计入）。"""
         with self.transaction() as s:
             ids = [task['id'] for task, _, _ in items]
             pending = {}
@@ -260,25 +263,28 @@ class Repository:
                 pending.update((row.id, row) for row in s.scalars(
                     select(Pending).where(Pending.id.in_(ids[start:start + 500]))))
             assets = self._by_path(s, Asset, [(task['mapping'], task['relative']) for task, _, _ in items])
-            settled = 0
+            counts = collections.Counter()
             for task, kind, observation in items:
                 key = (task['mapping'], task['relative'])
-                ok, row = self._settle_in(s, pending.get(task['id']), assets.get(key), task, kind,
-                                          observation, now)
+                ok, row, change = self._settle_in(s, pending.get(task['id']), assets.get(key), task, kind,
+                                                  observation, now)
                 if ok:
                     pending.pop(task['id'], None)  # pending 行已删除，同一任务的重复项不能再 settle
+                    counts['settled'] += 1
+                    if change:
+                        counts[change] += 1
                 if row is not None:
                     assets[key] = row
-                settled += ok
-            return settled
+            return counts
 
     def _settle_in(self, s, pending, row, task, kind, observation, now):
-        """先对 pending 行做 CAS 再应用观测；返回 (是否已 settle, asset 行)。"""
+        """先对 pending 行做 CAS 再应用观测；返回 (是否已 settle, asset 行, 变化)，
+        变化为 'new'、'modified'、'removed' 或 None（没有实际变化）。"""
         key = task['mapping']
         if (pending is None or pending.revision != self.revision[key]
                 or pending.observation != encode(task['observation']) or pending.due != task['due']):
-            return False, row
-        status = observation['status']
+            return False, row, None
+        status, change = observation['status'], None
         if status == 'present':
             fp = encode({'size': observation['fingerprint']['size'],
                          'mtime_ns': observation['fingerprint']['mtime_ns']})
@@ -289,6 +295,7 @@ class Repository:
                             b_state='', b_attempts=0, b_next=0, b_note='',
                             c_state='', c_attempts=0, c_next=PARKED if kind == 'video' else 0, c_note='')
                 s.add(row)
+                change = 'new'
             else:
                 self._align_revisions(row, key)
                 if row.a_state == 'missing':
@@ -301,6 +308,7 @@ class Repository:
                 changed = row.a_fp != fp or row.a_state != 'present' or row.kind != kind
                 row.kind = kind  # 视频后缀设置变化时重新分类
                 if changed:
+                    change = 'modified'
                     for target in ('b', 'c'):
                         setattr(row, target + '_attempts', 0)
                         setattr(row, target + '_next', _next_due(row, target))
@@ -314,6 +322,7 @@ class Repository:
             if row.a_state != 'missing':
                 row.a_state, row.missing_since = 'missing', now
                 row.b_attempts = row.c_attempts = 0
+                change = 'removed'
             # 新的缺失或再次确认：立即重新评估能否删除
             if row.b_state not in FINAL:
                 row.b_next = 0
@@ -321,7 +330,7 @@ class Repository:
                 row.c_next = _next_due(row, 'c')
             row.updated_at = now
         s.delete(pending)
-        return True, row
+        return True, row, change
 
     def _align_revisions(self, row, key):
         """对齐 revision：目标路径变化时重置该目标，旧目标上的同步结果对新目标无效。"""

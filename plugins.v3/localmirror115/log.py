@@ -4,11 +4,20 @@ import re
 from app.sdk.logging import logger
 
 __all__ = ['logger', 'NOTE_LABELS', 'TARGET_LABEL', 'TARGET_PLACE', 'MODE_LABEL', 'where', 'size_text', 'note_label',
-           'error_detail', 'duration_text']
+           'error_detail', 'duration_text', 'took_text', 'mappings_text', 'fmt']
 
 TARGET_LABEL = {'b': '115', 'c': 'STRM'}      # 日志前缀
 TARGET_PLACE = {'b': '115', 'c': 'STRM目录'}  # 通知中的目标名称
 MODE_LABEL = {'tree': '目录树', 'detail': '逐个详细比对'}
+
+
+def fmt(tag, action, *details, subject=''):
+    """生成一条日志：有对象时“【分类】动作：对象（细节，细节）”，没有对象时“【分类】动作：细节，细节”；空的细节自动略去。"""
+    text = '【%s】%s' % (tag, action)
+    details = '，'.join(str(detail) for detail in details if detail)
+    if subject:
+        return text + '：' + str(subject) + ('（%s）' % details if details else '')
+    return text + ('：' + details if details else '')
 
 
 def where(asset_or_key, relative=None):
@@ -25,6 +34,17 @@ def size_text(size):
         if size < 1024 or unit == 'GB':
             return ('%d %s' if unit == 'B' else '%.1f %s') % (size, unit)
         size /= 1024
+
+
+def took_text(seconds):
+    """“用时”文本：一分钟内精确到 0.1 秒（用时 2.9 秒），更长的用 duration_text（用时 2 分 05 秒）。"""
+    seconds = max(0.0, seconds)  # 时钟回退时不写出负的用时
+    return '用时 ' + ('%.1f 秒' % seconds if seconds < 60 else duration_text(seconds))
+
+
+def mappings_text(keys):
+    """把若干映射名写成“[movies]、[tv]”。"""
+    return '、'.join('[%s]' % key for key in sorted(keys))
 
 
 def duration_text(seconds):

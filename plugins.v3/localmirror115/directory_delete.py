@@ -8,7 +8,7 @@ from contextlib import ExitStack
 from pathlib import PurePosixPath
 
 from .adapters import RemoteUnknown, Stopped
-from .log import logger, where
+from .log import fmt, logger, where
 from .persistence import FINAL, owned_ids, tree_adopted
 
 
@@ -280,11 +280,12 @@ def _execute(engine, plans):
         if plan['fileid'] in deleted:
             engine.notifier.count('deleted_dirs_b')
             engine.notifier.count('deleted_b', plan['count'])
-            logger.info('【115】已删除目录（进入回收站）：%s/（含 %d 个文件，按目录一次删除）',
-                        where(plan['mapping'].key, plan['relative']), plan['count'])
+            logger.info(fmt('115', '已删除目录',
+                            '进入回收站', '含 %d 个文件，按目录一次删除' % plan['count'],
+                            subject=where(plan['mapping'].key, plan['relative']) + '/'))
             for row in plan['rows']:
                 if row['b_state'] not in FINAL:
-                    logger.info('【115】已删除（随目录）：%s', where(row))
+                    logger.info(fmt('115', '已删除', '随目录删除', subject=where(row)))
             _finish(engine, plan['rows'], 'deleted_to_recycle_bin')
         else:
             # 请求失败或结果不明：115 可能已删除只是响应丢失，先按不明处理再安排重试

@@ -10,8 +10,10 @@ from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 
 from .adapters import build_host_remote, transfer_target
-from .config import Config, DEFAULT_EXCLUDES, DEFAULT_SCAN_CRON, DEFAULT_VIDEO_EXTENSIONS
+from .config import (Config, DEFAULT_EXCLUDES, DEFAULT_SCAN_CRON, DEFAULT_VIDEO_EXTENSIONS, MAX_UPLOAD_WORKERS,
+                     WARN_UPLOAD_WORKERS)
 from .engine import SyncEngine, notification_state
+from .log import fmt
 from .notify import Notifier
 from .persistence import Asset, Pending, Repository
 
@@ -37,7 +39,7 @@ DEFAULTS = {
     'poll_seconds': 10, 'settle_seconds': 5, 'max_files': 2000000,
     # 高级：115访问与风控
     'api_qps': 2, 'failure_threshold': 3, 'cooldown_base_seconds': 60, 'cooldown_max_seconds': 1800,
-    'remote_refresh_hours': 24, 'tree_timeout_minutes': 60, 'verify_window_minutes': 30,
+    'remote_refresh_hours': 24, 'tree_timeout_minutes': 60, 'verify_window_minutes': 30, 'upload_workers': 2,
     # 高级：删除
     'delete_delay_hours': 0,
     # 高级：文件规则
@@ -188,7 +190,9 @@ def build_form():
             _row(_field('cooldown_max_seconds', '冷却上限（秒）'),
                  _field('remote_refresh_hours', '快照刷新间隔（小时）', '用于首次判断和反向核对'),
                  _field('tree_timeout_minutes', '目录树导出超时（分钟）')),
-            _row(_field('verify_window_minutes', '上传确认等待（分钟）', '索引未出现时等待多久再重传，同一版本最多3次')),
+            _row(_field('verify_window_minutes', '上传确认等待（分钟）', '索引未出现时等待多久再重传，同一版本最多3次'),
+                 _field('upload_workers', '同时上传数',
+                        '默认2，最多%d；%d个及以上更容易触发115风控，请谨慎' % (MAX_UPLOAD_WORKERS, WARN_UPLOAD_WORKERS))),
         ]),
         _panel('删除', 'mdi-delete-clock-outline', [
             _row(_field('delete_delay_hours', '删除延迟（小时）',
@@ -216,7 +220,7 @@ class LocalMirror115(_PluginBase):
     plugin_name = '本地115镜像'
     plugin_desc = '本地媒体库实时同步到115，并把非视频文件复制到STRM目录'
     plugin_icon = 'https://raw.githubusercontent.com/Smart-zsw/MoviePilot-Plugins/main/icons/localmirror115.png'
-    plugin_version = '1.0.1'
+    plugin_version = '1.0.2'
     plugin_author = 'Smart-zsw'
     author_url = 'https://github.com/Smart-zsw'
     plugin_config_prefix = 'localmirror115_'
@@ -253,17 +257,24 @@ class LocalMirror115(_PluginBase):
         batch = remote is not None and remote.batch_delete is not None
         c = self._config
         on = lambda flag: '开' if flag else '关'
-        logger.info('【启动】本地115镜像启动：模式=%s，上传115=%s，复制到STRM目录=%s，同步删除=%s'
-                    '（115=%s，STRM=%s，115批量删除=%s），监控模式=%s，MP整理事件=%s，定时兜底扫描=%s，115比对=%s，通知=%s',
-                    '试运行（只记录不执行）' if c.mode == 'dry_run' else '正式同步', on(c.upload_enabled),
-                    on(c.copy_enabled), on(c.delete_enabled), on(c.delete_b_enabled), on(c.delete_c_enabled),
-                    '开' if batch else '关（未填Cookie或未装p115client，逐个删除）',
-                    {'fast': '性能模式', 'compatibility': '兼容模式', 'off': '关'}[c.watch_mode],
-                    on(c.transfer_event_enabled),
-                    c.scan_cron if c.scan_enabled else '关', '目录树' if c.compare_mode == 'tree' else '逐个详细比对',
-                    on(c.notify_enabled))
+        logger.info(fmt('启动', '本地115镜像启动', '试运行（只记录不执行）' if c.mode == 'dry_run' else '正式同步',
+                        '上传115 %s' % on(c.upload_enabled), '复制到STRM目录 %s' % on(c.copy_enabled),
+                        '同步删除 %s' % on(c.delete_enabled), '删除115 %s' % on(c.delete_b_enabled),
+                        '删除STRM %s' % on(c.delete_c_enabled),
+                        '115批量删除 %s' % ('开' if batch else '关（未填Cookie或未装p115client，逐个删除）'),
+                        '同时上传 %d 个' % c.upload_workers,
+                        '监控 %s' % {'fast': '性能模式', 'compatibility': '兼容模式', 'off': '关'}[c.watch_mode],
+                        'MP整理事件 %s' % on(c.transfer_event_enabled),
+                        '定时兜底扫描 %s' % (c.scan_cron if c.scan_enabled else '关'),
+                        '115比对 %s' % ('目录树' if c.compare_mode == 'tree' else '逐个详细比对'),
+                        '通知 %s' % on(c.notify_enabled)))
+        if c.upload_workers >= WARN_UPLOAD_WORKERS:
+            logger.warning(fmt('启动', '同时上传数较高，更容易触发115风控',
+                               '建议 2～%d 个；一旦触发风控，MoviePilot 的115功能会暂停约 1 小时' % (WARN_UPLOAD_WORKERS - 1),
+                               subject='%d 个' % c.upload_workers))
         for m in c.mappings:
-            logger.info('【启动】[%s] 本地 %s → 115 %s，非视频文件 → %s', m.key, m.source, m.remote, m.output)
+            logger.info(fmt('启动', '路径映射', '115：%s' % m.remote,
+                            '非视频文件 → %s' % m.output, subject='[%s] %s' % (m.key, m.source)))
         self._engine.start()
 
     def _notifier(self):

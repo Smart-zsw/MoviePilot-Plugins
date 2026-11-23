@@ -402,3 +402,29 @@ def test_clock_jump_forward_restarts_the_delete_delay(harness):
     h.clock.advance(601)
     h.run()
     assert (h.c / 'S' / 'e1.nfo').exists()  # 删除延迟还没到
+
+
+def test_moviepilot_v3_temporary_files_are_never_synced(harness):
+    """MoviePilot V3 写入媒体库时在同目录产生的临时文件（.mp-partial、权限探测、软链接修复）始终排除。"""
+    h = harness(excludes='*.bak')
+    for name in ('S/.e1.nfo.0123456789abcdef0123456789abcdef.mp-partial', 'S/.mode-probe-0123456789abcdef',
+                 'S/.e1.mkv.0123456789abcdef0123456789abcdef.mp', 'S/e1.nfo'):
+        h.write(name, b'x')
+    h.settle()
+    h.run()
+    assert sorted(os.listdir(h.c / 'S')) == ['e1.nfo']
+    assert h.asset('S/.mode-probe-0123456789abcdef') is None
+
+
+def test_transient_untracked_file_is_not_counted_as_a_deletion(harness, caplog):
+    """出现后又很快消失、从未跟踪过的文件：不记为“消失”，也不推迟115删除的“连续删除”计时。"""
+    h = harness(**deleting())
+    path = h.write('S/scratch.tmpx', b'x')
+    h.engine.hint(str(path), 'filesystem')
+    path.unlink()
+    h.engine.hint(str(path), 'filesystem')
+    caplog.set_level(logging.INFO, logger='localmirror115')
+    h.clock.advance(2)
+    h.engine.tick()
+    assert '消失' not in caplog.text and 'tv' not in h.engine.last_absence
+    assert not h.repo.due(h.clock() + 3600)

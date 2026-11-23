@@ -119,14 +119,18 @@ def test_directory_counts_and_deferred_title():
     assert '92 个（1 个目录）' in text and '暂缓处理  2' in text
 
 
-def test_disabled_notifier_sends_nothing():
-    """关闭通知时不发送任何告警或汇总。"""
+def test_disabled_notifier_sends_nothing_but_still_logs_the_round(caplog):
+    """关闭通知时不发送任何告警或汇总，但本轮照常结束并写一行汇总日志。"""
+    import logging
+    caplog.set_level(logging.INFO, logger='localmirror115')
     sent = []
     n = Notifier(lambda t, x: sent.append(t), False)
     n.count('uploaded')
     assert not n.alert('conflict', 'A', 'x')
-    assert not n.flush(force=True)
-    assert sent == []
+    assert n.flush(force=True)
+    assert sent == [] and not any(n.counts.values())
+    assert [r.getMessage() for r in caplog.records if r.getMessage().startswith('【汇总】')] == [
+        '【汇总】本轮完成：上传115 1 个，处理用时 0 秒']
 
 
 def test_failed_delivery_keeps_counts_and_merges_new_results():
@@ -347,7 +351,7 @@ def test_failed_send_does_not_bring_back_a_file_resolved_meanwhile():
 
 
 def test_summary_counts_files_already_present_in_strm(harness):
-    """STRM 目录中已有相同文件时，本轮总结也列出“STRM目录已存在，无需复制”。"""
+    """STRM 目录中已有相同文件时，本轮总结也列出“STRM目录已存在（无需复制）”。"""
     h = harness(mode='sync', copy_enabled=True)
     sent = attach(h)
     h.write('S/e.nfo', b'meta')
@@ -358,4 +362,27 @@ def test_summary_counts_files_already_present_in_strm(harness):
     h.engine.run_b()
     h.clock.advance(60)
     h.engine.flush_notifications(force=True)
-    assert sent and 'STRM目录已存在，无需复制  1' in sent[-1][1]
+    assert sent and 'STRM目录已存在（无需复制）  1' in sent[-1][1]
+
+
+def test_round_summary_log_is_not_repeated_when_sending_fails(caplog):
+    """通知发送失败、计数合并回来重试时，汇总日志只补写之后新增的部分，不重复写已写过的数量。"""
+    import logging
+    caplog.set_level(logging.INFO, logger='localmirror115')
+    clock, sent, broken = Clock(1000.0), [], [True]
+
+    def send(title, text):
+        """第一次发送失败，之后成功。"""
+        if broken[0]:
+            broken[0] = False
+            raise ConnectionError('down')
+        sent.append(text)
+    n = Notifier(send, True, clock=clock)
+    n.count('uploaded', 5)
+    assert not n.flush(force=True)
+    n.count('uploaded', 3)
+    clock.advance(120)
+    assert n.flush(force=True)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith('【汇总】')]
+    assert [line.split('：')[1].split('，')[0] for line in lines] == ['上传115 5 个', '上传115 3 个']
+    assert '上传115  8 个' in sent[0]

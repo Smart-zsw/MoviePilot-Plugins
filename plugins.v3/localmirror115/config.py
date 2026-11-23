@@ -15,12 +15,16 @@ TEMP_SUFFIX = '.lm115tmp'  # 复制到 STRM 目录时的临时文件后缀
 # 默认排除的系统垃圾文件与下载中的临时文件（设置里可修改）。
 DEFAULT_EXCLUDES = ('.DS_Store', 'Thumbs.db', 'desktop.ini', '._*', '*.tmp', '*.part', '*.!qb',
                     '.snapshot', 'lost+found')
-# 各类 NAS 与操作系统的回收站、缩略图、索引目录：不论用户如何配置排除规则都排除，避免把回收站内容当成媒体镜像。
+# 不论用户如何配置排除规则都排除：各类 NAS 与操作系统的回收站、缩略图、索引目录（避免把回收站内容当成媒体镜像），
+# 本插件的临时文件，以及 MoviePilot V3 写入媒体库时在同目录产生的临时文件（写完即改名或删除：
+# .文件名.随机串.mp-partial、权限探测用的 .mode-probe-随机串、修复软链接用的 .文件名.随机串.mp）。
 SYSTEM_EXCLUDES = ('@Recycle', '@Recently-Snapshot', '.@__thumb', '@__thumb', '.@__desc', '.@__qini',
                    '$RECYCLE.BIN', 'System Volume Information', '.Trash-*', '.Trashes', '.Spotlight-V100',
                    '.fseventsd', '.TemporaryItems', '.AppleDouble', '@eaDir', '#recycle', '#snapshot',
-                   '*' + TEMP_SUFFIX)
+                   '*' + TEMP_SUFFIX, '.*.mp-partial', '.mode-probe-*', '.*.mp')
 MODES = ('dry_run', 'sync')
+MAX_UPLOAD_WORKERS = 10  # 同时上传数的上限
+WARN_UPLOAD_WORKERS = 6  # 同时上传数达到这么多时提醒：同时在传的文件多，115 更容易判定为异常而风控
 
 
 def parse_mappings(value):
@@ -83,6 +87,7 @@ class Config:
     excludes: tuple = DEFAULT_EXCLUDES + SYSTEM_EXCLUDES
     follow_symlinks: bool = False      # 跟随指向文件的软链接（默认只镜像真实文件）
     verify_window_minutes: float = 30.0
+    upload_workers: int = 2             # 同时上传到115的文件数（1～MAX_UPLOAD_WORKERS），所有文件一视同仁
     poll_seconds: float = 10.0
     compare_mode: str = 'tree'           # tree：导出目录树（cookie）；detail：逐目录 Open API 列表
     p115_cookie: str = field(default='', repr=False)  # 不进入 repr，避免泄露到日志
@@ -188,6 +193,9 @@ class Config:
         verify_window = max(5.0, float(raw.get('verify_window_minutes', 30)))
         if verify_window > 24 * 60 * 7:
             raise ValueError('上传确认等待超出范围（5 分钟～7 天）')
+        workers = int(raw.get('upload_workers', 2))
+        if not 1 <= workers <= MAX_UPLOAD_WORKERS:
+            raise ValueError('同时上传数只能是 1～%d' % MAX_UPLOAD_WORKERS)
         poll = float(raw.get('poll_seconds', 10))
         if not 1 <= poll <= 3600:
             raise ValueError('轮询间隔超出范围（1～3600 秒）')
@@ -232,7 +240,7 @@ class Config:
             delete_c_enabled=flag('delete_c_enabled', True), delete_delay_hours=delay,
             settle_seconds=settle, scan_seconds=scan, force_polling=watch_mode == 'compatibility',
             max_files=limit, video_extensions=video_set, excludes=exclude_list,
-            verify_window_minutes=verify_window, poll_seconds=poll, compare_mode=compare,
+            verify_window_minutes=verify_window, upload_workers=workers, poll_seconds=poll, compare_mode=compare,
             p115_cookie=str(raw.get('p115_cookie') or '').strip(), remote_refresh_hours=refresh,
             tree_timeout_minutes=tree_timeout, api_qps=qps, failure_threshold=threshold,
             cooldown_base_seconds=cool_base, cooldown_max_seconds=cool_max,
